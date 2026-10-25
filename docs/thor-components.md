@@ -32,18 +32,23 @@ Claims below trace to runs on one Thor unit with the pinned
 `ignition/components/sm103.py`. Component constructors branch on it exactly as
 the SM103 paths do today; shared policy never sees the capability.
 
-### Dense NVFP4 projections
+### Dense projections
 
-An SM110 variant of `QuantizedProjection` through `mm_fp4` with the `cutlass`
-or `cudnn` backend. Caller-owned `out` keeps capture allocation-free; workspace
-behavior per backend must be probed before wiring.
+Qwen3.8's dense weights are MXFP8 (E4M3 payload + 32-wide UE8M0 scales), not
+NVFP4, so the dense SM110 variant runs through `mm_mxfp8` (cutlass backend;
+the JIT module builds on sm_110a). The adapter reuses checkpoint payloads and
+decodes CSF scales to linear UE8M0 rows, then applies the verified 128x4
+swizzle. Probed with checkpoint tensors (layer-0 `in_proj_qkv`, 16 tokens):
+cosine 0.9999986, relative L2 0.0017 against exact dequantization. The
+`mm_fp4` NVFP4 dense path remains for recipes that store NVFP4 dense weights;
+it is unprobed at checkpoint format.
 
-The adapter reuses checkpoint payloads. Checkpoints store packed E2M1 values
-with CSF-compressed scales and calibrated global scales; `mm_fp4` consumes
-packed FP4 operands, linear E4M3 block scales (`use_8x4_sf_layout` selects the
-scale-factor layout), and a global alpha. CSF scales decode losslessly once at
-load, as `moe_sm103` does for trtllm-gen. Weights are never requantized;
-checkpoint global scales stay authoritative.
+Activation quantization on both dense and expert paths uses the runner's
+canonical dynamic grid rather than the checkpoint's static calibration scales;
+the checkpoint's `input_scale` values do not fold into the runner's scalar
+activation global scale (probing that variant fails). Replacing static
+checkpoint activation scales with dynamic quantization is a semantic decision
+for the component design and its measured bounds, not a silent substitution.
 
 ### Routed experts
 
@@ -57,12 +62,18 @@ only fused-MoE path verified on capability 110. Routing stays b12x
 validation rejects unsupported checkpoints with explicit messages, and shared
 experts stay on the dense component path.
 
-The weight adapter is the main cost. `CutlassNvfp4Config.prepare_weights`
-quantizes from BF16, which checkpoints do not carry — expert weights are
-already FP4. The adapter must re-lay out existing E2M1 payloads into the
-CUTLASS-swizzled weight layout and feed decoded linear scales plus the
-checkpoint's global scales, then verify the result against the
-`prepare_weights` reference before any recipe wiring.
+The weight adapter is the main cost, and probing has resolved its shape:
+`prepare_weights` quantizes from BF16, which checkpoints do not carry, so the
+adapter re-lays out existing E2M1 payloads into the CUTLASS runner's view
+without requantizing: payloads pass through, CSF scales decode to linear E4M3
+rows through the same expansion machinery the SM103 loader uses, a 128x4
+swizzle (byte-exact against `fp4_quantize`'s layout, verified) produces the
+weight block scales, and the checkpoint's per-expert global multipliers become
+`fc1_dequant_scale`/`fc2_dequant_scale`. The probed checkpoint pack reaches
+cosine 0.9964 against exact dequantization at layer-0 geometry — closer than
+the double-quantized `prepare_weights` round trip (0.9827) — and replays under
+CUDA graph capture with stable allocation. The w13 half order is `[up, gate]`
+with the activation applied to the second half, matching Qwen semantics.
 
 ### Attention and router
 
@@ -72,7 +83,10 @@ DSA indexer) must be probed on SM110 before wiring; `sm110_xqa` prepared plans
 are the replacement where a recipe's attention contract matches its semantics.
 The Triton kernels in the SM103 sparse-attention component compile for
 sm_110a but are unmeasured. The b12x router (`route_topk`) is portable and
-unchanged.
+unchanged; the CUTLASS runner's packed precomputed routing takes exactly the
+`topk_ids` int32 and `topk_weights` float32 tensors that routing emits, and
+captured graphs replay those buffers, so the component must own stable
+routing storage across replay.
 
 ## Recipe scope and phasing
 
@@ -110,22 +124,21 @@ memory, and ends with Helios service validation, not component probes alone.
   prefill, graph transitions, prefix reuse, and measured native replay. Report
   untested models and paths separately from implemented restrictions.
 
-## Open questions to resolve by probe before wiring
+## Open questions remaining after probing
 
-1. Whether the CUTLASS runner accepts externally quantized weights (checkpoint
-   payloads plus decoded scales) or only its own `prepare_weights` output;
-   this determines the adapter's depth.
-2. The `mm_fp4` weight scale-factor layout (8x4 vs 128x4) matching decoded
-   linear scales, and where checkpoint global scales fold into alpha.
-3. Whether the packed precomputed routing accepts b12x `route_topk` outputs
-   directly or needs its own packing step.
-4. Allocation-free graph replay for both paths at every prepared capacity.
-   Graph-pool intermediates follow the `moe_sm103` precedent; steady-state
-   allocation stays prohibited.
-5. Expert TP sharding: the runner declares no expert-parallel support, so
-   tensor-parallel intermediate slicing must be verified against the swizzled
-   weight layout and its scales.
-6. The context-attention path per recipe on SM110, before any recipe wiring.
+Probes on this unit (scripts and raw logs kept outside the repository under
+`~/work/thor-probes/`) resolved the adapter questions above. Still open:
+
+1. Whether TP sharding of the swizzled expert layout preserves the scale
+   grid's expert and tile boundaries (the runner declares no expert-parallel
+   support; slicing plan needed before TP qualification).
+2. The context-attention path per recipe on SM110 (QSA/indexer probes), before
+   any recipe wiring.
+3. Numerical bounds for the dynamic-activation-quantization decision above,
+   measured on the complete prepared path.
+4. Production loading must run against the validated checkpoint release; the
+   cached HF snapshots on this unit fail the manifest validator and probes
+   read tensors directly.
 
 If the SM110 path needs captured-graph native operations beyond the contracts
 the SM103 components introduced, that requires prior approval from project
