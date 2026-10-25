@@ -885,6 +885,22 @@ starting every rank through its host's `flare agent`. See
 [serving across DGX Sparks](multi-host.md) for agent installation, pairing,
 and failures.
 
+## Jetson Thor
+
+Jetson Thor's GPU is SM110 and shares physical DRAM with the CPU. Like Spark,
+it reports no VRAM through NVML, so Ignition identifies the integrated device
+through CUDA and plans against Linux `MemAvailable` capped by CUDA's device
+total. Device discovery, planning, graph registration, and package loading
+accept SM110.
+
+Recipe preparation on SM110 additionally requires FlashInfer kernels for the
+SM110 target. The pinned FlashInfer provides SM110 attention and SM100-family
+tcgen05 operators; its b12x block-scaled FP4/FP6/MXFP8 projections and NVFP4
+MoE remain SM103/SM120/SM121-only, so recipes whose prepared paths use them
+fail preparation on Thor until the kernels support SM110. Qualify preparation,
+memory, and serving on Thor independently; SM120/SM121 results do not
+establish SM110 behavior.
+
 ## Package and development serving
 
 Export a package, then launch the native server:

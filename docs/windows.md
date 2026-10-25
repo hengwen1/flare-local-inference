@@ -2,7 +2,7 @@
 
 Flare builds on Windows 11 x64 and ARM64 through Rust's
 `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets.
-Copy an exported `.safetensors` package matching the serving GPU's SM120 or
+Copy an exported `.safetensors` package matching the serving GPU's SM110, SM120, or
 SM121 architecture and its publisher profile to the Windows serving host.
 Serving requires payload format version 2 packages with typed prepared
 contracts and signed zstd-compressed executable frames.

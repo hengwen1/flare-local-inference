@@ -1,6 +1,6 @@
 # Working on Flare
 
-Flare is a local inference server for NVIDIA SM120/SM121 GPUs. Ignition, the
+Flare is a local inference server for NVIDIA SM120/SM121 and Jetson Thor (SM110) GPUs. Ignition, the
 Python package in `ignition/`, prepares models with PyTorch, Transformers, and
 FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
 `heliopause/` crate. The Rust CLI in `flare/` links Helios, the runtime library

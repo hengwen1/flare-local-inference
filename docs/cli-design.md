@@ -3,8 +3,8 @@
 For environment setup and model-specific launch examples, see
 [model preparation and serving](model-preparation.md).
 
-Flare serves the model architectures its recipes support on NVIDIA SM120 and
-SM121 GPUs. Recipes declare default checkpoints and supported preparation
+Flare serves the model architectures its recipes support on NVIDIA SM120, SM121,
+and SM110 (Jetson Thor) GPUs. Recipes declare default checkpoints and supported preparation
 capacities. The command line selects models, GPUs, concurrency, storage, and
 listeners. The engine derives memory and execution geometry from those choices;
 advanced preparation flags expose the explicit overrides listed below.

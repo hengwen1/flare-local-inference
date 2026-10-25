@@ -1,6 +1,6 @@
 # Flare core design
 
-Flare is a local inference server for NVIDIA SM120 and SM121 GPUs. It serves
+Flare is a local inference server for NVIDIA SM120, SM121, and SM110 (Jetson Thor) GPUs. It serves
 agent workloads with long contexts, repeated tool-result append, shared-prefix
 branches, and model-supported image inputs. Ignition prepares models in Python;
 Helios serves them in Rust through captured CUDA graphs.
@@ -210,7 +210,8 @@ available byte and unit of bandwidth, with predictable response times.
 ### Make a smaller promise than vLLM
 
 [vLLM's broad model, hardware, and distributed-serving support](https://docs.vllm.ai/en/latest/design/arch_overview/)
-is valuable and expensive to reproduce. Flare chooses NVIDIA SM120/SM121,
+is valuable and expensive to reproduce. Flare chooses NVIDIA SM120/SM121 and
+Jetson Thor (SM110),
 FlashInfer/b12x, selected model recipes, and interactive workloads on one host
 or supported cross-node tensor-parallel groups. [Multi-host serving](multi-host.md)
 uses prepared RoCEnante collectives; [Orbit](orbit.md) manages the hosts,

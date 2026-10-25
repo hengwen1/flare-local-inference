@@ -101,6 +101,24 @@ def test_integrated_discovery_uses_available_dram_without_swap(devices, monkeypa
     assert calls == ["init", "driver_init", "shutdown"]
 
 
+def test_thor_discovery_reports_sm110_as_supported_through_the_integrated_budget(devices, monkeypatch):
+    nvml, _, calls = devices
+    monkeypatch.setattr(nvml, "device_get_name", lambda handle: "NVIDIA Thor")
+    monkeypatch.setattr(nvml, "device_get_cuda_compute_capability", lambda handle: (11, 0))
+    unsupported(nvml, monkeypatch)
+
+    def meminfo(path):
+        assert path.as_posix() == "/proc/meminfo"
+        return f"MemFree: 1024 kB\nMemAvailable: {100 * (GIB // 1024)} kB\nSwapFree: 999999999 kB\n"
+
+    monkeypatch.setattr(planning.Path, "read_text", meminfo)
+    gpu, = planning.discover_gpus()
+    assert (gpu.name, gpu.capability) == ("NVIDIA Thor", (11, 0))
+    assert gpu.supported
+    assert (gpu.total_bytes, gpu.free_bytes) == (121 * GIB, 100 * GIB)
+    assert calls == ["init", "driver_init", "shutdown"]
+
+
 def test_missing_vram_report_requires_an_integrated_device(devices, monkeypatch):
     nvml, driver, calls = devices
     unsupported(nvml, monkeypatch)

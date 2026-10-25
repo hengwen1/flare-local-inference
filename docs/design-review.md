@@ -46,7 +46,7 @@ before committing; a design acknowledgment cannot authorize them.
    default-false opt-ins. Enums, callbacks, schema names, and metadata fields
    cannot serve as alternative model allowlists. Review each member and its
    consumers for a concrete meaning independent of model identity.
-4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM120/SM121, reuse proven
+4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM110/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
    Remove superseded internal paths unless compatibility is explicitly required.
    Package version validation is required by principle 13.

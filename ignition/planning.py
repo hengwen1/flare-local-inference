@@ -28,8 +28,8 @@ MINIMUM_REQUEST_TOKENS = 8192
 # Each exchange can retain prompt and terminal checkpoints; snapshot slots have
 # virtual capacity for about four recent exchanges per concurrent request.
 CACHE_STATES_PER_REQUEST = 8
-SUPPORTED_CAPABILITIES = ((10, 3), (12, 0), (12, 1))
-SUPPORTED_ARCHITECTURES = "SM103, SM120, or SM121"
+SUPPORTED_CAPABILITIES = ((10, 3), (11, 0), (12, 0), (12, 1))
+SUPPORTED_ARCHITECTURES = "SM103, SM110, SM120, or SM121"
 _GIB = 1 << 30
 
 

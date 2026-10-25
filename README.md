@@ -4,7 +4,8 @@
 
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
-Flare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
+Flare is a local inference server for NVIDIA SM120/SM121 and Jetson Thor (SM110)
+GPUs, built for
 long conversations, coding agents, and repeated tool use. Its goal is to make
 the memory, bandwidth, and compute in workstations and compact systems such
 as DGX Spark go further, while keeping generation responsive.
