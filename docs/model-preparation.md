@@ -891,7 +891,8 @@ Jetson Thor's GPU is SM110 and shares physical DRAM with the CPU. Like Spark,
 it reports no VRAM through NVML, so Ignition identifies the integrated device
 through CUDA and plans against Linux `MemAvailable` capped by CUDA's device
 total. Device discovery, planning, graph registration, and package loading
-accept SM110.
+accept SM110. See [Thor kernel and recipe support](thor.md) for the measured
+kernel matrix and the paths to recipe preparation.
 
 Recipe preparation on SM110 additionally requires FlashInfer kernels for the
 SM110 target. The pinned FlashInfer provides SM110 attention and SM100-family
