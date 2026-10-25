@@ -90,8 +90,8 @@ together. Refresh and commit `helios/Cargo.lock`, `flare/Cargo.lock`, and
 and Heliopause against the pinned revision. Compare rendered prompts and token
 IDs with upstream when changing encoder behavior.
 
-The preparation dependency pins a Git revision of `local-inference-lab/flashinfer`
-in `pyproject.toml`; `uv.lock` records the same commit. To change it, update the
+The preparation dependency pins the `jthor` branch of `hengwen1/flashinfer`
+in `pyproject.toml`; `uv.lock` records the resolved commit. To change it, update the
 revision, run `uv lock --upgrade-package flashinfer-python`, then sync the environment.
 For local FlashInfer development, install the sibling
 checkout explicitly with `uv pip install --python .venv/bin/python --no-deps -e ../flashinfer`;
