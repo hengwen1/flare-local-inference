@@ -78,6 +78,7 @@ Two routes exist; both keep the architecture boundaries in
 1. **Ignition SM110 components over FlashInfer mainline.** Wrap `mm_fp4` and
    `MoELayer` with `CutlassNvfp4Config` as SM110 component variants, and
    `sm110_xqa` prepared plans where a recipe's attention contract matches.
+   [The component plan](thor-components.md) stages this work and its validation.
    This is Python-side component and recipe work within the ordinary
    contribution rules. The weight-preparation adapter is the main cost:
    Flare's CSF-compressed FP4 checkpoint scales must convert to the TRTLLM

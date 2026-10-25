@@ -1,3 +1,8 @@
+[ ] Implement Thor recipe support through Ignition SM110 components, starting
+    with Qwen3.8: checkpoint-format weight adapters, dense mm_fp4, routed
+    experts through CutlassNvfp4Config, and per-recipe Thor qualification. See
+    thor-components.md.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
