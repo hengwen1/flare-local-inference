@@ -1587,11 +1587,24 @@ class DirectWeightLoader:
         shapes = ((count, (2 * local + 127) // 128 * 128, hidden_size // 16),
                   (count, hidden_size, (local // 16 + 3) // 4 * 4))
         from .sm103 import is_sm103
+        from .sm110 import is_sm110
 
         sm103 = is_sm103(self.device)
+        sm110 = is_sm110(self.device)
+        # SM103 and SM110 kernels take row-major scales; b12x takes the native
+        # swizzled F8_128x4 grid.
+        row_major = sm103 or sm110
+        if sm110:
+            # The CUTLASS NVFP4 runner is fixed A4 SwiGLU with no clamp input, and
+            # its 128x4 scale grid is local to the prepared matrix, so a sharded
+            # intermediate is unqualified.
+            if activation_mode != "a4" or swiglu_limit is not None:
+                raise ValueError("SM110 routed experts require A4 SwiGLU without a clamp")
+            if (first, last) != (0, intermediate_size):
+                raise ValueError("SM110 routed experts do not yet support intermediate sharding")
         # Expanding once at load spends the expanded scales' memory to keep the expansion,
         # its scratch writes and their rereads off every forward's critical path.
-        expand = sm103 or scale_scratch is None
+        expand = row_major or scale_scratch is None
         for scratch, shape in zip(() if scale_scratch is None else scale_scratch,
                                   () if scale_scratch is None else shapes, strict=True):
             if (scratch.device != self.device or scratch.dtype != torch.float8_e4m3fn
@@ -1637,17 +1650,21 @@ class DirectWeightLoader:
         if expand:
             from b12x._lib.quant._csf_prepare import expand_source_scales, validate_source
 
-            # SM103's kernels take row-major scales; b12x takes the native swizzled F8_128x4 grid.
+            # SM103's and SM110's kernels take row-major scales; b12x takes the native swizzled F8_128x4 grid.
             native = ((count, 2 * local, hidden_size // 16), (count, hidden_size, local // 16))
             expanded = []
-            for source, shape in zip((scales13, scales2), native if sm103 else shapes, strict=True):
+            for source, shape in zip((scales13, scales2), native if row_major else shapes, strict=True):
                 validate_source(source)
-                expanded.append(torch.empty(shape, dtype=torch.uint8 if sm103 else torch.float8_e4m3fn,
+                expanded.append(torch.empty(shape, dtype=torch.uint8 if row_major else torch.float8_e4m3fn,
                                             device=self.device))
-                expand_source_scales(source, expanded[-1], swizzled=not sm103)
+                expand_source_scales(source, expanded[-1], swizzled=not row_major)
             if sm103:
                 return _sm103_fp4_experts(w13, expanded[0], w2, expanded[1], scale_vectors, format="nvfp4",
                                           activation_mode=activation_mode, swiglu_limit=swiglu_limit)
+            if sm110:
+                from .moe_sm110 import prepare_cutlass_nvfp4_experts
+
+                return prepare_cutlass_nvfp4_experts(w13, expanded[0], w2, expanded[1], scale_vectors)
             block_scales = expanded
         else:
             block_scales = scale_scratch

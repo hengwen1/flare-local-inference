@@ -4,6 +4,10 @@
     CutlassNvfp4Config, attention probes, and per-recipe Thor qualification.
     See thor-components.md.
 
+[ ] Consolidate the tracing check and 256-byte scratch alignment duplicated in
+    moe_sm103.py, moe_sm110.py, and gdn_prefill_sm103.py into one component
+    helper before a fourth copy appears.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.

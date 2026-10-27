@@ -101,12 +101,16 @@ class PreparedRoutedExperts:
     """
 
     def __new__(cls, source=None, experts=None, *args, **kwargs):
-        # Experts loaded for SM103 execute through FlashInfer's native kernels. Unpickling, as compiler
-        # workers do with a forward's metadata, creates the instance without arguments.
+        # Experts loaded for SM103 or SM110 execute through FlashInfer's native kernels. Unpickling,
+        # as compiler workers do with a forward's metadata, creates the instance without arguments.
         from ignition.components.moe_sm103 import Sm103Experts, Sm103RoutedExperts
 
         if isinstance(experts, Sm103Experts):
             return Sm103RoutedExperts(source, experts, *args, **kwargs)
+        from ignition.components.moe_sm110 import CutlassNvfp4View, Sm110RoutedExperts
+
+        if isinstance(experts, CutlassNvfp4View):
+            return Sm110RoutedExperts(source, experts, *args, **kwargs)
         return super().__new__(cls)
 
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,

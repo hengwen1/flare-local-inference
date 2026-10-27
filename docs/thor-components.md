@@ -52,7 +52,7 @@ for the component design and its measured bounds, not a silent substitution.
 
 ### Routed experts
 
-`Sm110Experts` / `Sm110RoutedExperts` in `ignition/components/moe_sm110.py`,
+`CutlassNvfp4View` / `Sm110RoutedExperts` in `ignition/components/moe_sm110.py`,
 dispatched from `PreparedRoutedExperts.__new__` beside the SM103 dispatch.
 Execution goes through FlashInfer `MoELayer` with `CutlassNvfp4Config` — the
 only fused-MoE path verified on capability 110. Routing stays b12x
@@ -71,9 +71,20 @@ swizzle (byte-exact against `fp4_quantize`'s layout, verified) produces the
 weight block scales, and the checkpoint's per-expert global multipliers become
 `fc1_dequant_scale`/`fc2_dequant_scale`. The probed checkpoint pack reaches
 cosine 0.9964 against exact dequantization at layer-0 geometry — closer than
-the double-quantized `prepare_weights` round trip (0.9827) — and replays under
-CUDA graph capture with stable allocation. The w13 half order is `[up, gate]`
+the double-quantized `prepare_weights` round trip (0.9827) — and its prepared
+plan replays allocation-stable under CUDA graph capture. That probe compares
+eager launches only: its replay comparison re-drew routing ids through
+`ids.to(torch.int32)`, which copies, so the kernel replayed the original routes
+while the reference combined the new ones. Replay numerics come from the
+component test below, not from that probe. The w13 half order is `[up, gate]`
 with the activation applied to the second half, matching Qwen semantics.
+
+Weights must keep checkpoint magnitudes. Fixtures an order of magnitude away
+from the release measured 0.53 relative L2 through every global-scale
+convention tried, and only checkpoint-magnitude weights reproduced the probe's
+0.086; the mechanism was not isolated. The component test therefore quantizes
+at the release's weight scale and derives the per-expert multipliers the way
+the release does (`amax / 448`).
 
 ### Attention and router
 
@@ -117,6 +128,12 @@ memory, and ends with Helios service validation, not component probes alone.
   then run checkpoint-format weights through the adapters and compare against
   the BF16-quantized `prepare_weights` reference and against b12x on SM120
   within FP4-specific bounds. Measure repeatability.
+- **Routed experts.** `tests/components/test_moe_sm110_cuda.py` runs the
+  prepared component at Qwen3.8 expert geometry through eager and compiled
+  forwards, captures it, and replays allocation-stable over tokens 1, 4, 24,
+  and 512. Measured on Thor: relative L2 0.0894-0.0906 against dequantized
+  activations and 0.1631-0.1640 against the BF16 source, bounded at 0.10 and
+  0.18.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.
@@ -135,7 +152,9 @@ Probes on this unit (scripts and raw logs kept outside the repository under
 2. The context-attention path per recipe on SM110 (QSA/indexer probes), before
    any recipe wiring.
 3. Numerical bounds for the dynamic-activation-quantization decision above,
-   measured on the complete prepared path.
+   measured on the complete prepared path. Component-level bounds are recorded
+   under [validation per phase](#validation-per-phase); recipe bounds still
+   require the validated checkpoint release.
 4. Production loading must run against the validated checkpoint release; the
    cached HF snapshots on this unit fail the manifest validator and probes
    read tensors directly.
