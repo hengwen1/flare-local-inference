@@ -58,17 +58,33 @@ route selection recorded on the plan.
 
 ## Recipe preparation
 
-Every current recipe fails preparation on Thor. Projections and routed experts
-prepare through b12x block-scaled kernels (`blockscaled` linear weights,
-`nvfp4_csf` MoE), which cannot compile for SM110. MiniMax M3 rejects SM110
-explicitly; other recipes fail inside FlashInfer with the CuTe DSL arch check
-or the ptxas error. Weight loading completes before those failures, so the
-error surfaces minutes into preparation.
+Qwen3.8-Flash-Next is the first recipe that prepares, exports, and serves on
+Thor through the [Ignition SM110 components](thor-components.md). `ignition
+export qwen3.8-flash` writes a package named for the device (`thor-tp1-...`),
+and `flare run` loads it and answers requests: on this unit a 65-token chat
+request returned the correct answer, a 5652-token prompt prefilled through
+chunked prefill in 1.2 s, and repeated requests reported prefix-cache hits.
+Loading reports 86.78 GiB of weights and a 23.89 GiB cache budget limited by
+unified memory.
+
+Other recipes still fail preparation on Thor. Their projections and routed
+experts prepare through b12x block-scaled kernels (`blockscaled` linear
+weights, `nvfp4_csf` MoE), which cannot compile for SM110. MiniMax M3 rejects
+SM110 explicitly; other recipes fail inside FlashInfer with the CuTe DSL arch
+check or the ptxas error. Weight loading completes before those failures, so
+the error surfaces minutes into preparation.
+
+Preparation of this checkpoint peaks near Thor's 122 GiB of unified memory at
+the default 4096-token prefill chunk: the 89 GiB of prepared weights plus the
+captured prefill graphs exceed it, and the host OOM killer ends the run while
+compiled forwards warm. `--prefill-chunk-size 1024` fits comfortably and was
+used for the export above.
 
 Kernel availability does not imply serving support. Per-recipe qualification
 on Thor — measured numerical bounds, preparation and serving memory under
 unified memory, latency under pressure, and every prepared capacity — remains
-outstanding, and SM120/SM121 results do not establish SM110 behavior.
+outstanding beyond this export and serving pass, and SM120/SM121 results do not
+establish SM110 behavior.
 
 ## Paths to recipe support
 

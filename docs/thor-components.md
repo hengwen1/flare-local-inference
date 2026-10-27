@@ -161,9 +161,13 @@ stable routing storage across replay.
 
 1. **Qwen3.8 first.** Its experts are NVFP4 with CSF scales and its dense
    weights are MXFP8 — exactly the verified kernel mapping. The routed-expert
-   and dense components are prepared and measured at Qwen3.8 geometry;
-   attention probes come next, then integration, per-capacity capture, export,
-   and a Helios serving pass.
+   and dense components are prepared and measured at Qwen3.8 geometry, and the
+   recipe now prepares, exports, and serves on Thor: `ignition export
+   qwen3.8-flash --prefill-chunk-size 1024` writes `thor-tp1-202610272207`, and
+   `flare run` answers chat requests from it. The 1024-token chunk is a memory
+   fit, not a component limit: the default 4096-token graphs exceed unified
+   memory during preparation with 89 GiB of weights resident. Per-recipe
+   numerical bounds and the remaining capacity sweeps stay outstanding.
 2. **Other recipes follow only where kernel coverage exists.** MXFP4 and FP6
    expert storage has no verified SM110 path (b12x blocked; the CUTLASS runner
    is NVFP4-only), so GLM-, DeepSeek-, and Kimi-class recipes keep failing
