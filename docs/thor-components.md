@@ -52,6 +52,13 @@ approximating it: NVFP4 dense weights (`mm_fp4` remains for recipes that store
 them and is unprobed at checkpoint format), A16 activations, input widths that
 the checkpoint padded to 128, and the two-stream parallel projection path.
 
+Unquantized BF16 projections run through `Sm110Bf16Projection` in the same
+module, dispatched from `UnquantizedProjection`. b12x's BF16 GEMV requires
+SM120/SM121 and FlashInfer's cutlass BF16 backend rejects capability 110, so the
+capability's dense BF16 kernel is cuDNN's, which folds the bias in its epilogue
+and writes the caller's output. It needs no scratch: nothing is quantized.
+Recipes that pass FP32 unquantized operands stay rejected explicitly.
+
 Activation quantization on both dense and expert paths uses the runner's
 canonical dynamic grid rather than the checkpoint's static calibration scales;
 the checkpoint's `input_scale` values do not fold into the runner's scalar
@@ -148,6 +155,10 @@ memory, and ends with Helios service validation, not component probes alone.
   tokens 1, 16, 128, and 512. Measured on Thor: relative L2 0.001652-0.001667
   against dequantized activations and 0.026510-0.026743 against the BF16
   source, bounded at 0.003 and 0.035.
+- **Unquantized projections.** `tests/components/test_linear_sm110_bf16_cuda.py`
+  covers the same shapes for the BF16 kernel over the same token counts.
+  Measured on Thor: relative L2 0.001642-0.001695 against the FP32 product with
+  its folded bias, bounded at 0.003.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.

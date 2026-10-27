@@ -49,7 +49,7 @@ def _aligned(nbytes):
 
 
 def serves(device) -> bool:
-    """Whether dense projections on ``device`` run through this kernel."""
+    """Whether dense projections on ``device`` run through this module's kernels."""
     from .sm110 import is_sm110
 
     return is_sm110(device)
@@ -296,3 +296,137 @@ class Sm110Mxfp8Projection:
         if self.bias is not None:
             output.add_(self.bias)
         return output
+
+
+@dataclass(frozen=True)
+class Bf16ProjectionQuery:
+    """Exact unquantized dense projection; the kernel has one launch shape."""
+
+    num_tokens: int
+    in_features: int
+    out_features: int
+
+
+def _bf16_tactics(query: Bf16ProjectionQuery):
+    # One Ignition tactic: cuDNN picks its own engine for the shape.
+    return (0,)
+
+
+BF16_CONTRACT = native_contract(component_id="flare.sm110.bf16_projection",
+                                query_type=Bf16ProjectionQuery, tactics=_bf16_tactics,
+                                semantic_version=1)
+
+
+class _Bf16State:
+    """The cuDNN BF16 GEMM over one exact shape.
+
+    FlashInfer rejects the cutlass backend on capability 110, so this is the
+    capability's dense BF16 kernel. It folds the bias in its epilogue and writes
+    the caller's output, so a launch neither allocates nor copies.
+    """
+
+    implementation = "cudnn_bf16"
+
+    def __init__(self, query: Bf16ProjectionQuery, tactic):
+        self.query = query
+
+    def run(self, source, weight, bias, output):
+        from flashinfer import mm_bf16
+
+        mm_bf16(source, weight.t(), bias=bias, out=output, backend="cudnn")
+        return output
+
+
+def plan_bf16_projection(*, tokens: int, in_features: int, out_features: int, device):
+    """Declare one exact-shape native unquantized dense projection."""
+    query = Bf16ProjectionQuery(int(tokens), int(in_features), int(out_features))
+    return native_plan(contract=BF16_CONTRACT, query=query, device=device,
+                       scratch_bytes=lambda tactic: 0,
+                       materialize=lambda tactic: _Bf16State(query, tactic))
+
+
+@torch.library.custom_op("flare::sm110_bf16_out", mutates_args=("out",))
+def _sm110_bf16_out(source: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
+                    out: torch.Tensor, plan_handle: int) -> None:
+    plan = plan_from_handle(plan_handle)
+    require_prepared(plan, plan.component_id, source.device).run(source, weight, bias, out)
+
+
+@_sm110_bf16_out.register_fake
+def _fake_sm110_bf16_out(source, weight, bias, out, plan_handle) -> None:
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class Sm110Bf16Binding:
+    """Exact tensors of one prepared native unquantized projection launch."""
+
+    plan: object
+    state: object
+    source: torch.Tensor
+    weight: torch.Tensor
+    bias: torch.Tensor | None
+    output: torch.Tensor
+    implementation: str
+
+    def run(self):
+        if _tracing():
+            torch.ops.flare.sm110_bf16_out(self.source, self.weight, self.bias, self.output,
+                                           self.plan._handle)
+        else:
+            self.state.run(self.source, self.weight, self.bias, self.output)
+        return self.output
+
+
+def _bind_bf16(plan, state, source, weight, bias, output):
+    tokens, hidden = source.shape
+    query = plan.query
+    if (source.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16
+            or (tokens, hidden) != (query.num_tokens, query.in_features)
+            or tuple(weight.shape) != (query.out_features, query.in_features)):
+        raise ValueError("SM110 unquantized projections require the prepared contiguous BF16 operands")
+    if not source.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("SM110 unquantized projections require contiguous operands")
+    if output.dtype != torch.bfloat16 or output.shape != (tokens, query.out_features) or not output.is_contiguous():
+        raise ValueError("SM110 unquantized output must be contiguous BF16 [tokens, out_features]")
+    if bias is not None and (bias.dtype != torch.bfloat16 or tuple(bias.shape) != (query.out_features,)):
+        raise ValueError("SM110 unquantized bias must be BF16 [out_features]")
+    if any(t.device != source.device for t in (weight, output, *(() if bias is None else (bias,)))):
+        raise ValueError("SM110 unquantized projection tensors must share one device")
+    return Sm110Bf16Binding(plan, state, source, weight, bias, output, state.implementation)
+
+
+def _benchmark_bf16(state, *, plan, source, weight, bias, output):
+    binding = _bind_bf16(plan, state, source, weight, bias, output)
+    return PreparedCall(run=binding.run, output=output, owners=(binding,))
+
+
+class Sm110Bf16Projection:
+    """Prepared unquantized dense projection with fixed source and output storage."""
+
+    def __init__(self, source, weight, output, *, session, name: str,
+                 bias: torch.Tensor | None = None):
+        self.source, self.weight, self.output, self.bias = source, weight, output, bias
+        self.plan = plan_bf16_projection(tokens=source.shape[0], in_features=source.shape[1],
+                                         out_features=output.shape[-1], device=source.device)
+        plan = self.plan
+
+        def prepare_call(state):
+            binding = _bind_bf16(plan, state, source, weight, bias, output)
+            return PreparedCall(run=binding.run, owners=(binding,))
+
+        declare(session, (plan.request(
+            name=name,
+            prepare_call=prepare_call,
+            benchmark_call=partial(_benchmark_bf16, plan=plan, source=source, weight=weight,
+                                   bias=bias, output=output),
+        ),))
+
+        def finalize():
+            state = require_prepared(plan, plan.component_id, source.device)
+            self.binding = _bind_bf16(plan, state, source, weight, bias, output)
+
+        register_finalizer(session, finalize)
+
+    def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        return self.binding.run()

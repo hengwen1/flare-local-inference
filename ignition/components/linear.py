@@ -109,6 +109,13 @@ class UnquantizedProjection:
         for tensor in (weight, bias):
             if tensor is not None:
                 record_numeric_tensor(tensor)
+        # b12x's BF16 GEMV targets SM120/SM121; SM110 runs FlashInfer's cuDNN BF16
+        # GEMM under the same preparation.
+        self.sm110 = None
+        if linear_sm110.serves(source.device):
+            self.sm110 = linear_sm110.Sm110Bf16Projection(source, weight, output, session=session,
+                                                           name=name, bias=bias)
+            return
         # FlashInfer's GEMMs read and write contiguous rows; column slices of wider rows keep b12x's GEMV.
         rows = source.numel() // source.shape[-1]
         self.dense = (sm103_projection.is_sm103(source.device) and bias is None
@@ -141,6 +148,8 @@ class UnquantizedProjection:
         ),))
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        if self.sm110 is not None:
+            return self.sm110(source)
         if self.dense:
             torch.ops.flare.sm103_dense_out(source, self.weight, self.output, self.plan.handle)
             return self.output
