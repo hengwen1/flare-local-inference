@@ -119,12 +119,19 @@ component and its tests, not by that probe.
 
 ### Attention and router
 
-b12x paged decode attention works on SM110 and needs no variant. Per recipe,
-the context/prefill path and any sparse-selection machinery (Qwen's QSA, GLM's
-DSA indexer) must be probed on SM110 before wiring; `sm110_xqa` prepared plans
-are the replacement where a recipe's attention contract matches its semantics.
-The Triton kernels in the SM103 sparse-attention component compile for
-sm_110a but are unmeasured. The b12x router (`route_topk`) is portable and
+b12x paged decode attention works on SM110 and needs no variant, and so does
+b12x's QSA. Prepared on Thor and run eagerly, repeated, and through a captured
+graph at tp1 geometry over 8 packed decode rows at context 2048, QSA produced
+finite output, identical results across repeated eager runs, and replay output
+equal to eager with no steady-state allocation. That probe checked finiteness,
+repeatability, and replay identity rather than b12x's references, because the
+fork's benchmark harness still reads plan attributes b12x has since removed
+(`plan.caps`, `plan.workspace_q_rows`); the recipe tests remain the numeric
+authority. Prefill row counts and the sparse-selection variants of other
+recipes (GLM's DSA indexer) stay unprobed, and `sm110_xqa` prepared plans are
+the replacement where a recipe's attention contract matches its semantics. The
+Triton kernels in the SM103 sparse-attention component compile for sm_110a but
+are unmeasured. The b12x router (`route_topk`) is portable and
 unchanged; the CUTLASS runner's packed precomputed routing takes exactly the
 `topk_ids` int32 and `topk_weights` float32 tensors that routing emits, and
 captured graphs replay those buffers, so the component must own stable
@@ -178,6 +185,9 @@ memory, and ends with Helios service validation, not component probes alone.
   kernels run on SM110; the recipe's gated-delta layers keep their existing
   non-SM103 branch and are validated through the Qwen3.8 GDN tests, which need
   the validated checkpoint release.
+- **Attention.** QSA prepares and runs on SM110: finite, repeatable eager
+  output, and replay equal to eager with no steady-state allocation, at tp1
+  geometry over 8 packed decode rows at context 2048.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.
