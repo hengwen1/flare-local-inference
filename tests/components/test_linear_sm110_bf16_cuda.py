@@ -91,6 +91,31 @@ def test_bf16_dense_uses_cudnn(operands, tokens, compiled):
     _run_component(operands, tokens, compiled=compiled)
 
 
+def test_strided_output_is_staged(operands):
+    """A column slice of a wider buffer is written through contiguous staging."""
+    weight, bias = operands
+    tokens = 16
+    wide = torch.zeros((tokens, OUT_FEATURES + 256), dtype=torch.bfloat16, device="cuda")
+    output = wide[:, :OUT_FEATURES]
+    assert not output.is_contiguous()
+    source = torch.zeros((tokens, IN_FEATURES), dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode(), PreparationSession(device=source.device, autotune=True,
+                                                    compile_workers=0) as session:
+        projection = linear.UnquantizedProjection(source, weight, output, session=session,
+                                                  name="sm110_bf16_strided", bias=bias)
+        session.freeze()
+        generator = torch.Generator(device="cuda").manual_seed(99)
+        activations = (torch.randn((tokens, IN_FEATURES), generator=generator, device="cuda") * 0.5)
+        activations = activations.to(torch.bfloat16)
+        source.copy_(activations)
+        projection(source)
+        torch.cuda.synchronize()
+        expected = activations.float() @ weight.float().T + bias.float()
+        metrics = _metrics(output, expected)
+        assert metrics["relative_l2_error"] < ERROR_BOUND, metrics
+        assert torch.count_nonzero(wide[:, OUT_FEATURES:]) == 0
+
+
 def test_fp32_operands_are_rejected(operands):
     weight, bias = operands
     source = torch.zeros((4, IN_FEATURES), dtype=torch.float32, device="cuda")

@@ -121,3 +121,71 @@ def _run_component(weight, tokens, *, compiled):
 @pytest.mark.parametrize("compiled", [False, True])
 def test_mxfp8_dense_uses_cutlass(weight, tokens, compiled):
     _run_component(weight, tokens, compiled=compiled)
+
+
+def test_narrow_width_scratch_views_its_exact_extent():
+    """Widths whose padding is not 256-aligned view only their own extent."""
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        pytest.skip("assign a CUDA device explicitly")
+    if torch.cuda.get_device_capability(0) != (11, 0):
+        pytest.skip("SM110 dense projections require a Jetson Thor")
+    generator = torch.Generator(device="cuda").manual_seed(640)
+    in_features, out_features, tokens = 640, 2560, 1
+    source = torch.randn((out_features, in_features), generator=generator, device="cuda") * WEIGHT_STD
+    values, scales = mxfp8_quantize(source.to(torch.bfloat16), is_sf_swizzled_layout=False)
+    scales = scales.view(out_features, in_features // 32)
+    prepared = MXFP8LinearWeight(
+        weight=MXFP8Rows(values=values, scale_rows=scales.view(torch.float8_e8m0fnu).unsqueeze(0),
+                         scale_mma=None),
+        in_features=in_features, padded_in_features=in_features, out_features=out_features)
+    decoded = _decode(values, scales)
+    activations = torch.randn((tokens, in_features), generator=generator, device="cuda") * 0.5
+    activations = activations.to(torch.bfloat16)
+    output = torch.zeros((tokens, out_features), dtype=torch.bfloat16, device="cuda")
+    workspace = ScratchArena("cuda:0")
+    with torch.inference_mode(), PreparationSession(device="cuda", autotune=True, compile_workers=0) as session:
+        projection = linear.QuantizedProjection(activations, prepared, output, session=session,
+                                               name="sm110_mxfp8_narrow", workspace=workspace)
+        session.freeze()
+        workspace.finalize()
+        workspace.freeze()
+        projection(activations)
+        torch.cuda.synchronize()
+        quantized, quantized_scales = mxfp8_quantize(activations, is_sf_swizzled_layout=False)
+        dequantized = _decode(quantized, quantized_scales.view(tokens, in_features // 32))
+        metrics = _metrics(output, dequantized @ decoded.T)
+        assert metrics["relative_l2_error"] < ADAPTER_BOUND, metrics
+
+
+def test_narrow_output_pads_to_the_kernel_minimum():
+    """Outputs below the kernel's 128 minimum pad with zero rows."""
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        pytest.skip("assign a CUDA device explicitly")
+    if torch.cuda.get_device_capability(0) != (11, 0):
+        pytest.skip("SM110 dense projections require a Jetson Thor")
+    generator = torch.Generator(device="cuda").manual_seed(96)
+    in_features, out_features, tokens = 2560, 96, 16
+    source = torch.randn((out_features, in_features), generator=generator, device="cuda") * WEIGHT_STD
+    values, scales = mxfp8_quantize(source.to(torch.bfloat16), is_sf_swizzled_layout=False)
+    scales = scales.view(out_features, in_features // 32)
+    prepared = MXFP8LinearWeight(
+        weight=MXFP8Rows(values=values, scale_rows=scales.view(torch.float8_e8m0fnu).unsqueeze(0),
+                         scale_mma=None),
+        in_features=in_features, padded_in_features=in_features, out_features=out_features)
+    decoded = _decode(values, scales)
+    activations = torch.randn((tokens, in_features), generator=generator, device="cuda") * 0.5
+    activations = activations.to(torch.bfloat16)
+    output = torch.zeros((tokens, out_features), dtype=torch.bfloat16, device="cuda")
+    workspace = ScratchArena("cuda:0")
+    with torch.inference_mode(), PreparationSession(device="cuda", autotune=True, compile_workers=0) as session:
+        projection = linear.QuantizedProjection(activations, prepared, output, session=session,
+                                               name="sm110_mxfp8_narrow_out", workspace=workspace)
+        session.freeze()
+        workspace.finalize()
+        workspace.freeze()
+        projection(activations)
+        torch.cuda.synchronize()
+        quantized, quantized_scales = mxfp8_quantize(activations, is_sf_swizzled_layout=False)
+        dequantized = _decode(quantized, quantized_scales.view(tokens, in_features // 32))
+        metrics = _metrics(output, dequantized @ decoded.T)
+        assert metrics["relative_l2_error"] < ADAPTER_BOUND, metrics
