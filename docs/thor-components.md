@@ -35,13 +35,22 @@ the SM103 paths do today; shared policy never sees the capability.
 ### Dense projections
 
 Qwen3.8's dense weights are MXFP8 (E4M3 payload + 32-wide UE8M0 scales), not
-NVFP4, so the dense SM110 variant runs through `mm_mxfp8` (cutlass backend;
-the JIT module builds on sm_110a). The adapter reuses checkpoint payloads and
-decodes CSF scales to linear UE8M0 rows, then applies the verified 128x4
-swizzle. Probed with checkpoint tensors (layer-0 `in_proj_qkv`, 16 tokens):
-cosine 0.9999986, relative L2 0.0017 against exact dequantization. The
-`mm_fp4` NVFP4 dense path remains for recipes that store NVFP4 dense weights;
-it is unprobed at checkpoint format.
+NVFP4, so the dense SM110 variant runs through `mm_mxfp8` (cutlass backend; the
+JIT module builds on sm_110a). `Sm110Mxfp8Projection` in
+`ignition/components/linear_sm110.py`, dispatched from `QuantizedProjection`
+beside the SM103 branch, passes checkpoint E4M3 payloads through and takes
+FlashInfer's own `block_scale_interleave` for the 128x4 block-scale grid —
+verified byte-identical to the probe's swizzle — so no weight is requantized.
+The module's sm100 quantizer writes quantized activations into caller-owned
+scratch, and `mm_mxfp8` writes into the caller's output, so a launch neither
+allocates nor copies in steady state. Probed with checkpoint tensors (layer-0
+`in_proj_qkv`, 16 tokens): cosine 0.9999986, relative L2 0.0017 against exact
+dequantization.
+
+The dense component rejects what the kernel cannot honor rather than
+approximating it: NVFP4 dense weights (`mm_fp4` remains for recipes that store
+them and is unprobed at checkpoint format), A16 activations, input widths that
+the checkpoint padded to 128, and the two-stream parallel projection path.
 
 Activation quantization on both dense and expert paths uses the runner's
 canonical dynamic grid rather than the checkpoint's static calibration scales;
@@ -102,8 +111,8 @@ routing storage across replay.
 ## Recipe scope and phasing
 
 1. **Qwen3.8 first.** Its experts are NVFP4 with CSF scales and its dense
-   weights are NVFP4 — exactly the verified kernel mapping. Component probes at
-   toy shapes are done for MoE; the checkpoint-format adapter, dense path, and
+   weights are MXFP8 — exactly the verified kernel mapping. The routed-expert
+   and dense components are prepared and measured at Qwen3.8 geometry;
    attention probes come next, then integration, per-capacity capture, export,
    and a Helios serving pass.
 2. **Other recipes follow only where kernel coverage exists.** MXFP4 and FP6
@@ -134,6 +143,11 @@ memory, and ends with Helios service validation, not component probes alone.
   and 512. Measured on Thor: relative L2 0.0894-0.0906 against dequantized
   activations and 0.1631-0.1640 against the BF16 source, bounded at 0.10 and
   0.18.
+- **Dense projections.** `tests/components/test_linear_sm110_cuda.py` runs the
+  prepared projection at Qwen3.8 `in_proj_qkv` geometry the same way over
+  tokens 1, 16, 128, and 512. Measured on Thor: relative L2 0.001652-0.001667
+  against dequantized activations and 0.026510-0.026743 against the BF16
+  source, bounded at 0.003 and 0.035.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.

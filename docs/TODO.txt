@@ -8,6 +8,10 @@
     moe_sm103.py, moe_sm110.py, and gdn_prefill_sm103.py into one component
     helper before a fourth copy appears.
 
+[ ] Accept dense input widths that a checkpoint padded to 128 in the SM110
+    MXFP8 projection; prepare_mxfp8_dense rejects them today because the kernel
+    needs the activation operand padded to the same width.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.

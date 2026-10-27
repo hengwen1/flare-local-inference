@@ -9,7 +9,7 @@ import torch
 from b12x.gemm import bf16_gemv, blockscaled
 from b12x.preparation import PreparationSession, PreparedCall
 
-from ignition.components import sm103_projection
+from ignition.components import linear_sm110, sm103_projection
 from ignition.preparation.fixtures import bf16_gemv as bf16_fixtures
 from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
 from ignition.preparation.fixtures.projection import input_factory
@@ -168,6 +168,15 @@ class QuantizedProjection:
         if bias is not None and _overlap(output, bias):
             raise ValueError("projection output must not overlap bias")
 
+        # b12x block-scaled dense GEMMs target SM120/SM121; SM110 runs FlashInfer's
+        # cutlass MXFP8 kernel under the same preparation.
+        self.sm110 = None
+        if linear_sm110.serves(source.device):
+            self.sm110 = linear_sm110.Sm110Mxfp8Projection(
+                source, weight, output, session=session, name=name, workspace=workspace,
+                bias=bias, activation_mode=activation_mode)
+            return
+
         self.weight = weight
         self.output = output
         self.activation_scale = getattr(weight, "activation_global_scale", None)
@@ -237,6 +246,8 @@ class QuantizedProjection:
         register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        if self.sm110 is not None:
+            return self.sm110(source)
         if self.sm103:
             values, scales, gain = self.parts
             if self.workspace is None:
@@ -380,6 +391,8 @@ class ParallelProjections:
         self.arena = workspace
         self.values, self.scales, self.outputs, self.plans = [], [], [], []
         for projection in self.projections:
+            if projection.sm110 is not None:
+                raise ValueError("parallel projections are not prepared on SM110")
             values, scales, gain, fp4 = _weight_parts(projection.weight)
             if (values.dtype not in (torch.float8_e4m3fn, torch.uint8) or gain is not None or fp4
                     or projection.bias is not None):
