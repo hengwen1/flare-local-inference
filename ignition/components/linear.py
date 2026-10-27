@@ -362,6 +362,13 @@ def _fake_sm103_bmm_out(source, weight, out):
     pass
 
 
+def parallel_projection_supported(device) -> bool:
+    """Whether ``device`` runs the parallel block-scaled GEMMs stream overlap forks."""
+    from b12x.gemm import blockscaled
+
+    return blockscaled.is_supported(device)
+
+
 @torch.library.custom_op("flare::parallel_mx_projections", mutates_args=("outputs", "workspaces"))
 def _parallel_mx_projections(
     source: torch.Tensor, values: list[torch.Tensor], scales: list[torch.Tensor],

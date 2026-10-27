@@ -2,6 +2,7 @@
 
 import torch
 
+from ignition.components import linear
 from ignition.components.linear import QuantizedProjection
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
@@ -102,6 +103,11 @@ class ConcurrentSharedExpert:
 
         if not isinstance(workspace, ScratchArena) or not parallel_plans:
             raise ValueError("shared-expert overlap requires an arena and concurrent main-stream plans")
+        # The fork runs b12x's parallel block-scaled GEMMs, or its small-N BF16
+        # GEMV for unquantized weights; neither is prepared for this capability.
+        if not linear.parallel_projection_supported(workspace.device):
+            raise ValueError("shared-expert overlap requires b12x block-scaled parallel GEMMs, "
+                             "which this device does not support; disable stream overlap")
         self.activation = getattr(mlp, "activation", "swiglu")
         if self.activation not in ("swiglu", "relu2"):
             raise ValueError("shared-expert overlap requires SwiGLU or ReLU-squared activation")

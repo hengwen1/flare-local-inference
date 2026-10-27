@@ -6,6 +6,7 @@ import weakref
 import torch
 from b12x.attention import qsa
 
+from ignition.components import linear
 from ignition.components.linear import _parallel_mx_projections
 from ignition.preparation.tuning import register_finalizer
 
@@ -42,6 +43,11 @@ class ConcurrentAttention:
     def __init__(self, attention, *, session, workspace):
         from b12x.gemm.blockscaled._a16 import _weight_parts
 
+        # Both projections fork onto the auxiliary stream through b12x's parallel
+        # block-scaled GEMMs, which this capability does not support.
+        if not linear.parallel_projection_supported(workspace.device):
+            raise ValueError("attention overlap requires b12x block-scaled parallel GEMMs, "
+                             "which this device does not support; disable stream overlap")
         self.attention, self.arena = attention, workspace
         self.projections = tuple(attention.projections[key]
                                  for key in ("qkv_proj", "indexer.index_qk_proj"))

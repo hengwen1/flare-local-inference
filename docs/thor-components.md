@@ -59,6 +59,14 @@ capability's dense BF16 kernel is cuDNN's, which folds the bias in its epilogue
 and writes the caller's output. It needs no scratch: nothing is quantized.
 Recipes that pass FP32 unquantized operands stay rejected explicitly.
 
+Stream overlap is rejected on SM110. Both overlap paths fork prepared
+projections onto an auxiliary stream: the quantized branches run b12x's parallel
+block-scaled GEMMs, which report no support for the capability, and the BF16
+branch runs b12x's small-N GEMV, which is unverified there. The shared-expert
+and Qwen3.8 attention overlap constructors therefore raise with the reason and
+the remedy instead of capturing a fork that cannot be prepared. Recipes disable
+stream overlap on SM110; single-stream composition is the supported path.
+
 Activation quantization on both dense and expert paths uses the runner's
 canonical dynamic grid rather than the checkpoint's static calibration scales;
 the checkpoint's `input_scale` values do not fold into the runner's scalar
@@ -188,6 +196,9 @@ memory, and ends with Helios service validation, not component probes alone.
 - **Attention.** QSA prepares and runs on SM110: finite, repeatable eager
   output, and replay equal to eager with no steady-state allocation, at tp1
   geometry over 8 packed decode rows at context 2048.
+- **Stream overlap.** `tests/components/test_overlap_sm110_cuda.py` asserts the
+  capability reports no parallel block-scaled GEMM support and that both overlap
+  constructors reject it.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.
