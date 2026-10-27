@@ -139,11 +139,13 @@ authority. Prefill row counts and the sparse-selection variants of other
 recipes (GLM's DSA indexer) stay unprobed, and `sm110_xqa` prepared plans are
 the replacement where a recipe's attention contract matches its semantics. The
 Triton kernels in the SM103 sparse-attention component compile for sm_110a but
-are unmeasured. The b12x router (`route_topk`) is portable and
-unchanged; the CUTLASS runner's packed precomputed routing takes exactly the
-`topk_ids` int32 and `topk_weights` float32 tensors that routing emits, and
-captured graphs replay those buffers, so the component must own stable
-routing storage across replay.
+are unmeasured. The b12x router (`route_topk`) needs no SM110 variant: measured
+on Thor over 64 rows of 128 experts with top 8, sigmoid scores, and
+renormalized weights, it returned exactly `torch.topk`'s ids and the reference
+renormalized weights. The CUTLASS runner's packed precomputed routing takes
+exactly the `topk_ids` int32 and `topk_weights` float32 tensors that routing
+emits, and captured graphs replay those buffers, so the component must own
+stable routing storage across replay.
 
 ## Recipe scope and phasing
 
@@ -199,6 +201,8 @@ memory, and ends with Helios service validation, not component probes alone.
 - **Stream overlap.** `tests/components/test_overlap_sm110_cuda.py` asserts the
   capability reports no parallel block-scaled GEMM support and that both overlap
   constructors reject it.
+- **Router.** `route_topk` matched `torch.topk` ids and reference renormalized
+  weights at 64 rows of 128 experts with top 8.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.
