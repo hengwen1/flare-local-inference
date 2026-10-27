@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Platforms a package may be named for. These are the NVIDIA device
 /// identifiers Flare already uses for revisions, not SM architecture names.
-pub const PLATFORMS: [&str; 2] = ["gb10", "gb202"];
+pub const PLATFORMS: [&str; 3] = ["gb10", "gb202", "thor"];
 
 /// Platform for one NVIDIA PCI id in NVML's `device<<16 | vendor` layout.
 ///
@@ -24,6 +24,9 @@ pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     let device = pci_id >> 16;
     if device == 0x2e12 {
         return Some("gb10");
+    }
+    if device == 0x2b00 {
+        return Some("thor");
     }
     GB202_DEVICES.contains(&device).then_some("gb202")
 }
@@ -151,6 +154,10 @@ mod tests {
             candidate("gb10", 8, at(1_792_228_980)).as_deref(),
             Some("gb10-tp8-202610170923")
         );
+        assert_eq!(
+            candidate("thor", 1, at(1_792_228_980)).as_deref(),
+            Some("thor-tp1-202610170923")
+        );
         assert!(candidate("sm120", 1, at(0)).is_none());
         assert!(candidate("gb202", 0, at(0)).is_none());
     }
@@ -158,6 +165,7 @@ mod tests {
     #[test]
     fn pci_ids_select_the_platform_identifier() {
         assert_eq!(platform_from_pci(0x2e12_10de), Some("gb10"));
+        assert_eq!(platform_from_pci(0x2b00_10de), Some("thor"));
         for device in GB202_DEVICES {
             assert_eq!(
                 platform_from_pci(device << 16 | 0x10de),
