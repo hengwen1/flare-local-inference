@@ -20,7 +20,7 @@ from ignition.components.recurrent import (
 )
 from ignition.preparation.scratch import ScratchArena
 
-from ignition.components import sm103
+from ignition.components import linear, sm103
 from ignition.components.gdn_prefill_sm103 import PreparedGdnPrefill, PrefillBuffers
 
 from .gdn_recovery import GDNRecords, PreparedRecoveredRecurrence
@@ -262,8 +262,10 @@ class PreparedGDN:
                                 for key, output in (*inputs, ("in_proj_ba", scratch.projected_ba))}
             self.projections["out_proj"] = projection("out_proj", scratch.gated, scratch.output)
             self.parallel_projections = None
+            # The parallel path forks both projections through block-scaled GEMMs.
             if (self.fused_qkvz and mode == "decode" and self.tokens <= 16
                     and isinstance(projection_workspace, ScratchArena) and projection_workspace.overlap
+                    and linear.parallel_projection_supported(projection_workspace.device)
                     and all(isinstance(self.projections[key], QuantizedProjection)
                             for key in ("in_proj_qkvz", "in_proj_ba"))):
                 from ignition.components.linear import ParallelProjections

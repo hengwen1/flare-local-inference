@@ -11,7 +11,7 @@ from b12x.attention import paged_kv_write, qsa
 from b12x.preparation import PreparationSession, PreparedCall
 from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
-from ignition.components import sm103
+from ignition.components import linear, sm103
 from ignition.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.preparation.fixtures import qsa as qsa_fixtures
@@ -297,8 +297,10 @@ class PreparedAttention:
                 scratch.selected_positions, metadata.main_block_table, metadata.request_ids,
                 metadata.query_positions, scratch.attended, partial=scratch.partial,
                 partial_lse=scratch.partial_lse)
+        # Attention overlap forks both projections through parallel block-scaled GEMMs.
         self.concurrent = (ConcurrentAttention(self, session=session, workspace=workspace)
-                           if concurrent and workspace.overlap else None)
+                           if concurrent and workspace.overlap
+                           and linear.parallel_projection_supported(source.device) else None)
 
     def dynamic(self) -> dict:
         return {"query": self.scratch.query, "index_query": self.index_query,
