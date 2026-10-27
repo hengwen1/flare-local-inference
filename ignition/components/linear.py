@@ -178,12 +178,16 @@ class QuantizedProjection:
             raise ValueError("projection output must not overlap bias")
 
         # b12x block-scaled dense GEMMs target SM120/SM121; SM110 runs FlashInfer's
-        # cutlass MXFP8 kernel under the same preparation.
+        # cutlass MXFP8 and cuDNN W4A16 kernels under the same preparation.
         self.sm110 = None
         if linear_sm110.serves(source.device):
-            self.sm110 = linear_sm110.Sm110Mxfp8Projection(
-                source, weight, output, session=session, name=name, workspace=workspace,
-                bias=bias, activation_mode=activation_mode)
+            if activation_mode == "a16":
+                self.sm110 = linear_sm110.Sm110Nvfp4A16Projection(
+                    source, weight, output, session=session, name=name, bias=bias)
+            else:
+                self.sm110 = linear_sm110.Sm110Mxfp8Projection(
+                    source, weight, output, session=session, name=name, workspace=workspace,
+                    bias=bias, activation_mode=activation_mode)
             return
 
         self.weight = weight

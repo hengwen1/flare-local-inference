@@ -48,9 +48,19 @@ allocates nor copies in steady state. Probed with checkpoint tensors (layer-0
 dequantization.
 
 The dense component rejects what the kernel cannot honor rather than
-approximating it: NVFP4 dense weights (`mm_fp4` remains for recipes that store
-them and is unprobed at checkpoint format), A16 activations, input widths that
-the checkpoint padded to 128, and the two-stream parallel projection path.
+approximating it: A16 activations on MXFP8 weights, and the two-stream parallel
+projection path.
+
+Sixteen-bit activations with NVFP4 weights (`W4A16_NVFP4`) run through
+`Sm110Nvfp4A16Projection`, dispatched from `QuantizedProjection` when a call
+site asks for `a16`. FlashInfer's remaining W4A16 backends reject capability
+110, so the capability's kernel is cuDNN's `mm_bf16_fp4`, prepared once at load
+through `prepare_bf16_fp4_weights`. It needs no scratch because nothing is
+quantized, and the folded bias is added after the launch. Checkpoints pad the
+stored input width to 128 and zero the extra columns, so the component trims
+the payload and unswizzles the block scales back to the logical width instead of
+running a wider GEMM; the trimmed matrix is exact. Qwen3.8's vision MLP and
+merger need this path.
 
 Unquantized BF16 projections run through `Sm110Bf16Projection` in the same
 module, dispatched from `UnquantizedProjection`. b12x's BF16 GEMV requires
@@ -187,6 +197,11 @@ memory, and ends with Helios service validation, not component probes alone.
   tokens 1, 16, 128, and 512. Measured on Thor: relative L2 0.001652-0.001667
   against dequantized activations and 0.026510-0.026743 against the BF16
   source, bounded at 0.003 and 0.035.
+- **16-bit-activation dense.** `tests/components/test_linear_sm110_nvfp4_a16_cuda.py`
+  covers Qwen3.8 vision MLP and merger geometry at tokens 4, 16, 128, and 512 in
+  eager and compiled forwards with folded bias, plus the padded-width trim and
+  the MXFP8 rejection. Measured on Thor: relative L2 0.002303-0.002367 against
+  the exact decode of the same tensors, bounded at 0.003.
 - **Unquantized projections.** `tests/components/test_linear_sm110_bf16_cuda.py`
   covers the same shapes for the BF16 kernel over the same token counts.
   Measured on Thor: relative L2 0.001642-0.001695 against the FP32 product with
