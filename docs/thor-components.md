@@ -102,6 +102,21 @@ convention tried, and only checkpoint-magnitude weights reproduced the probe's
 at the release's weight scale and derives the per-expert multipliers the way
 the release does (`amax / 448`).
 
+### Linear attention
+
+Qwen3.8's gated-delta layers need no SM110 component. b12x's `gdn_decode`,
+`gdn_prefill`, and `short_conv` kernels compile for sm_110a and run correctly,
+measured on Thor at Qwen3.8 layer-0 geometry (48 value heads, 16 key heads,
+128-wide heads, 10240 convolution channels, width 4) against b12x's own
+references: `gdn_decode` matched output exactly and recurrent state to 3.5e-8,
+and `gdn_prefill` reached 4.3e-3 output and 2.9e-3 state relative L2. The
+component therefore takes its existing non-SM103 branch, which is also the
+SM120 serving path; the SM103 chunked prefill stays SM103-only.
+`short_conv` ran, but the standalone reference used for that probe did not
+reproduce the mode's activation and rounding semantics (0.577 relative L2 raw,
+0.154 after SiLU), so its numerics remain established only through the recipe
+component and its tests, not by that probe.
+
 ### Attention and router
 
 b12x paged decode attention works on SM110 and needs no variant. Per recipe,
@@ -159,6 +174,10 @@ memory, and ends with Helios service validation, not component probes alone.
   covers the same shapes for the BF16 kernel over the same token counts.
   Measured on Thor: relative L2 0.001642-0.001695 against the FP32 product with
   its folded bias, bounded at 0.003.
+- **Linear attention.** The GDN decode, GDN prefill, and short-convolution
+  kernels run on SM110; the recipe's gated-delta layers keep their existing
+  non-SM103 branch and are validated through the Qwen3.8 GDN tests, which need
+  the validated checkpoint release.
 - **Preparation on Thor.** The complete serving shape catalog through one
   preparation batch with tuning declarations; memory budgeted against
   `MemAvailable` under unified memory; export succeeds.
