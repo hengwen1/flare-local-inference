@@ -1,11 +1,13 @@
 # Jetson Thor (SM110)
 
 Flare admits Jetson Thor (compute capability 11.0) as a preparation and serving
-device. Recipe preparation on Thor is not yet available: every current recipe's
-prepared paths run b12x kernels that cannot execute on SM110. This document
-records what works on the hardware, what remains blocked, and the paths to
-full recipe support. The device-admission change and its validation are in
-commit `633d58c8`; the pinned FlashInfer is `hengwen1/flashinfer` at `jthor`.
+device, and Qwen3.8-Flash-Next prepares, exports, and serves on it through the
+[Ignition SM110 components](thor-components.md). Every other recipe still fails
+preparation because its prepared paths run b12x kernels that cannot execute on
+SM110. This document records what works on the hardware, how to build and run
+there, what remains blocked, and the paths to full recipe support. The
+device-admission change and its validation are in commit `633d58c8`; the pinned
+FlashInfer is `hengwen1/flashinfer` at `jthor`.
 
 ## Device
 
@@ -21,7 +23,8 @@ commit `633d58c8`; the pinned FlashInfer is `hengwen1/flashinfer` at `jthor`.
   NVML Python bindings.
 - The runtime is architecture-agnostic: packages record the prepared
   capability as `[major, minor]` data, Helios validates it at load, and Orbit
-  names the hardware revision `sm110` through its capability fallback.
+  names the hardware revision `sm110` through its capability fallback. Package
+  export naming maps NVML's `0x2b00` device id to the `thor` platform.
 
 The surrounding stack is ready: torch 2.14.1+cu132 ships sm_110 SASS, Triton
 3.8.0 compiles for sm_110a, the cuTile toolchain carries sm_110 targets, and
@@ -58,14 +61,14 @@ route selection recorded on the plan.
 
 ## Recipe preparation
 
-Qwen3.8-Flash-Next is the first recipe that prepares, exports, and serves on
-Thor through the [Ignition SM110 components](thor-components.md). `ignition
-export qwen3.8-flash` writes a package named for the device (`thor-tp1-...`),
-and `flare run` loads it and answers requests: on this unit a 65-token chat
-request returned the correct answer, a 5652-token prompt prefilled through
-chunked prefill in 1.2 s, and repeated requests reported prefix-cache hits.
-Loading reports 86.78 GiB of weights and a 23.89 GiB cache budget limited by
-unified memory.
+Qwen3.8-Flash-Next prepares, exports, and serves on Thor through the
+[Ignition SM110 components](thor-components.md). `ignition export
+qwen3.8-flash` writes a package named for the device (`thor-tp1-...`), and
+`flare run` loads it and answers requests: on this unit a 65-token chat request
+returned the correct answer, a 5652-token prompt prefilled through chunked
+prefill in 1.2 s, and repeated requests reported prefix-cache hits. Loading
+reports 86.78 GiB of weights and a 23.89 GiB cache budget (1,945,600 KV tokens)
+limited by unified memory.
 
 Other recipes still fail preparation on Thor. Their projections and routed
 experts prepare through b12x block-scaled kernels (`blockscaled` linear
@@ -74,17 +77,182 @@ SM110 explicitly; other recipes fail inside FlashInfer with the CuTe DSL arch
 check or the ptxas error. Weight loading completes before those failures, so
 the error surfaces minutes into preparation.
 
-Preparation of this checkpoint peaks near Thor's 122 GiB of unified memory at
-the default 4096-token prefill chunk: the 89 GiB of prepared weights plus the
-captured prefill graphs exceed it, and the host OOM killer ends the run while
-compiled forwards warm. `--prefill-chunk-size 1024` fits comfortably and was
-used for the export above.
-
 Kernel availability does not imply serving support. Per-recipe qualification
 on Thor — measured numerical bounds, preparation and serving memory under
 unified memory, latency under pressure, and every prepared capacity — remains
 outstanding beyond this export and serving pass, and SM120/SM121 results do not
 establish SM110 behavior.
+
+## Build and run
+
+Run commands from the repository root. Every number below was measured on one
+Thor unit; treat it as that unit's behavior rather than a general claim.
+
+### Host prerequisites
+
+Thor shares one 122 GiB DRAM pool between CPU and GPU, so preparation and
+serving draw on the same memory. Install the build dependencies first:
+
+```sh
+sudo apt-get install -y build-essential libssl-dev liburing-dev \
+    protobuf-compiler ninja-build libibverbs-dev
+```
+
+`libibverbs-dev` is required because Flare's `roce` feature compiles
+`helios/native/roce_proxy.c`; without it the Helios build script fails on
+`infiniband/verbs.h`.
+
+Install the Rust toolchain that builds Helios, the extension, and the CLI:
+
+```sh
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+```
+
+Python dependencies follow the [environment setup](model-preparation.md#environment-setup).
+FlashInfer's JIT builds need `ninja` and a compiler on `PATH`, and the
+FlashInfer build cache lives under `~/.cache/flashinfer`.
+
+### Build
+
+```sh
+# Python dependencies
+uv sync --locked --extra prepare --extra test
+
+# Heliopause extension (Python-side export entry points)
+uv pip install --python .venv/bin/python --no-deps ./heliopause
+
+# Flare CLI and Helios runtime
+cargo build --release --manifest-path flare/Cargo.toml
+```
+
+Rebuild the extension after changing `heliopause/` or the Helios code it uses,
+and rebuild the CLI after changing `flare/` or `helios/`. The extension build is
+the long one; a release build of the CLI alone finishes in about a minute once
+Helios is compiled.
+
+### Get the checkpoint
+
+The recipe pins a repository and revision in
+`ignition/preparation/qwen38.py`: `nvidia/Qwen3.8-Flash-Next-FP4-Local` at
+`b9ce18a6887e18c089fdea8509a33e63429a3300`.
+
+```sh
+hf download nvidia/Qwen3.8-Flash-Next-FP4-Local \
+    --revision b9ce18a6887e18c089fdea8509a33e63429a3300
+```
+
+The snapshot is about 102 GiB in 21 shards; leave room for the export, which
+writes another 99 GiB into the package cache. Other Qwen3.8 repositories on the
+Hub are not interchangeable: their configuration or index differs, and
+preparation rejects them.
+
+### Export
+
+```sh
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m ignition export qwen3.8-flash \
+    --gpus 0 --max-concurrency 1 --no-mtp --prefill-chunk-size 1024 --verbose
+```
+
+Flags that matter on Thor:
+
+- `--gpus 0` selects the integrated GPU; the package records tensor-parallel
+  size 1.
+- `--max-concurrency 1` keeps the prepared capacities small.
+- `--no-mtp` skips speculative decoding, which is not prepared here.
+- `--prefill-chunk-size 1024` is a memory fit, not a component limit. The
+  default 4096-token prefill graphs plus the 89 GiB of prepared weights exceed
+  Thor's unified memory during compiled-forward warming, and the OOM killer ends
+  the run. 1024 fits with room to spare.
+
+With warm kernel and compiled-forward caches the export takes about ten minutes
+and ends by printing the cache entry:
+
+```
+Exported cache entry: ~/.cache/flare/packages/models/nvidia_2FQwen3.8-Flash-Next-FP4-Local/thor-tp1-202610272207
+```
+
+### Serve
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./flare/target/release/flare run \
+    ~/.cache/flare/packages/models/nvidia_2FQwen3.8-Flash-Next-FP4-Local/thor-tp1-202610272207
+```
+
+The first run stops at the signing-key prompt and prints the fingerprint of the
+local development key. Re-run with the two acknowledgements it names, which is
+also what unattended runs need:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./flare/target/release/flare run PACKAGE \
+    --dangerously-accept-publisher local-development \
+    --dangerously-approve-key 47958bf701392e197aced25eeaaedf038d10b8b4a887a07645092730c4ef3019
+```
+
+The fingerprint is generated per machine; read it from the prompt instead of
+copying the value above. Progress reports the loaded weights, the cache budget,
+and the listening address:
+
+```
+[    OK    ] Load weights.  71.3 GiB  10.7s
+[    OK    ] Allocate cache.  23.9 GiB · 1945600 KV tokens · 8 shared snapshot slots · limited by memory  25.6s
+[    OK    ] Start server.  http://127.0.0.1:8000 · 262144 tokens/request  1.5s
+```
+
+Stop Flare with Ctrl-C or SIGTERM so native replay drains before CUDA resources
+are released.
+
+### Verify
+
+```sh
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nvidia/Qwen3.8-Flash-Next-FP4-Local",
+       "messages":[{"role":"user","content":"What is the capital of France?"}],
+       "max_tokens":48}'
+```
+
+On this unit that request answered `Paris is the capital of France.` A
+5652-token prompt prefilled through several 1024-token chunks in 1.2 s, and a
+repeat of an earlier prompt reported `"cached_tokens":57`, confirming prefix
+reuse. The model reports reasoning text in `reasoning_content`, so short
+`max_tokens` budgets can return `content: null` with `finish_reason: "length"`.
+
+## Troubleshooting
+
+**Ninja compilation is killed during preparation.** FlashInfer's JIT compiles
+the CUTLASS fused-MoE module while the prepared weights are resident. Unbounded
+parallel `nvcc` jobs exhaust memory and the kernel OOM killer ends the build.
+Limit the job count and resume; ninja keeps finished objects:
+
+```sh
+MAX_JOBS=2 FLASHINFER_NVCC_THREADS=2 .venv/bin/python -m ignition export ...
+```
+
+The first build of that module takes tens of minutes on this 20-core ARM host,
+and `FLASHINFER_NVCC_THREADS` parallelizes compilation units within it.
+
+**Preparation is OOM-killed after "Warm compiled forwards".** That is the
+4096-token prefill graphs described above; pass `--prefill-chunk-size 1024`.
+
+**`setStorage ... out of bounds` while warming a compiled forward.** Compiled
+forwards cached under a different prefill chunk are being reused. Clear the
+cache and re-export:
+
+```sh
+rm -rf ~/.cache/flare/kernels/forwards
+```
+
+**`NVML reports unsupported GPU PCI id`.** The package-naming table in
+`helios/src/package/naming.rs` does not know this GPU. Thor reports device
+`0x2b00` and maps to the `thor` platform identifier; rebuild the extension after
+changing the table.
+
+**Checkpoint index rejected.** Preparation validates the snapshot against the
+recipe's expected manifest. A different Qwen3.8 repository fails with missing
+quantized-layer declarations or an unexpected `ple_embedding_dtype`; use the
+pinned revision.
+
+**`/tmp` does not survive reboots.** Keep probe scripts elsewhere.
 
 ## Paths to recipe support
 
@@ -107,14 +275,3 @@ Two routes exist; both keep the architecture boundaries in
    validated on Thor. That is kernel development in the pinned fork and falls
    under [the CUDA kernel authorship restriction](../AGENTS.md); route it to
    the qualified maintainer.
-
-## Working on the Thor host
-
-- Setup follows [the preparation guide](model-preparation.md#environment-setup).
-  The build additionally needs `libssl-dev`, `liburing-dev`, and
-  `protobuf-compiler`, and flashinfer's JIT builds need `ninja` on `PATH`.
-- The flashinfer JIT cache lives under `~/.cache/flashinfer`. The first build
-  of the CUTLASS fused-MoE module took roughly forty minutes on this 20-core
-  ARM host; `FLASHINFER_NVCC_THREADS=4` parallelizes compilation units and
-  ninja resumes interrupted builds.
-- `/tmp` does not survive reboots. Keep probe scripts elsewhere.
