@@ -230,6 +230,27 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Finds the remote stage graph with the same prepared name as the local graph.
+///
+/// Preparation gives every stage the same graph names for operations that cross
+/// a boundary; stages may declare additional local graphs.
+pub fn select_stage_graph(
+    stage: &crate::model::contract::PipelineStage,
+    name: &str,
+) -> Result<u32> {
+    stage
+        .graphs
+        .iter()
+        .position(|graph| graph.graph == name)
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| {
+            protocol_error(&format!(
+                "pipeline stage {} has no graph named {name}",
+                stage.index
+            ))
+        })
+}
+
 /// Copies the uploads a remote stage declares into a control payload.
 ///
 /// Stage zero packs every local input once; this filter keeps the uploads whose
@@ -520,6 +541,52 @@ mod tests {
         let mut encoded = request().encode().unwrap();
         encoded[..4].copy_from_slice(&2u32.to_be_bytes());
         assert!(StageRequest::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn remote_stage_graphs_are_selected_by_prepared_name() {
+        let stage = crate::model::contract::PipelineStage {
+            index: 1,
+            first_layer: 8,
+            last_layer: 16,
+            pages: 1,
+            state_rows: 1,
+            snapshots: 1,
+            graphs: vec![
+                crate::model::contract::GraphContract {
+                    graph: "prefill".into(),
+                    kind: crate::model::contract::GraphOperation::Prefill,
+                    inputs: vec![],
+                    state: vec![],
+                    state_rows_per_request: 0,
+                    draft_cursor: None,
+                    embedding_tables: vec![],
+                    pending_token: None,
+                },
+                crate::model::contract::GraphContract {
+                    graph: "decode".into(),
+                    kind: crate::model::contract::GraphOperation::Decode,
+                    inputs: vec![],
+                    state: vec![],
+                    state_rows_per_request: 0,
+                    draft_cursor: None,
+                    embedding_tables: vec![],
+                    pending_token: None,
+                },
+            ],
+            cache: crate::model::contract::CacheContract {
+                page_tokens: 16,
+                regions: vec![],
+                page_tables: vec![],
+            },
+            inputs: vec![],
+            outputs: vec![],
+            has_vision: false,
+            has_mtp: false,
+            has_head: false,
+        };
+        assert_eq!(select_stage_graph(&stage, "decode").unwrap(), 1);
+        assert!(select_stage_graph(&stage, "vision").is_err());
     }
 
     #[test]
