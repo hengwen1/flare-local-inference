@@ -468,6 +468,12 @@ impl BoundaryConsumer {
         }
     }
 
+    /// Reports a local stage failure to the upstream producer.
+    pub fn fail(&mut self, message: &str) -> io::Result<()> {
+        self.link
+            .send_parts(FrameKind::Error, 0, message.as_bytes())
+    }
+
     /// Releases a consumed slot and acknowledges it to the producer.
     pub fn release(&mut self, fence: u64) -> io::Result<()> {
         self.complete(fence, FrameKind::Release, &[])
@@ -553,6 +559,21 @@ mod tests {
         let frame = consumer.receive().unwrap();
         assert_eq!(frame.kind, FrameKind::Error);
         assert_eq!(frame.fence, 9);
+        assert_eq!(
+            std::str::from_utf8(&frame.payload).unwrap(),
+            "stage 1 copy failed"
+        );
+    }
+
+    #[test]
+    fn consumer_failures_are_reported_to_the_producer() {
+        let (producer, consumer) = pair();
+        let mut producer = BoundaryProducer::new(producer);
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let reporting = std::thread::spawn(move || producer.link.receive().unwrap());
+        consumer.fail("stage 1 copy failed").unwrap();
+        let frame = reporting.join().unwrap();
+        assert_eq!(frame.kind, FrameKind::Error);
         assert_eq!(
             std::str::from_utf8(&frame.payload).unwrap(),
             "stage 1 copy failed"

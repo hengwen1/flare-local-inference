@@ -181,6 +181,10 @@ impl StageWorker {
     pub fn commit_with(&mut self, fence: u64, payload: &[u8]) -> io::Result<()> {
         self.input.commit_with(fence, payload)
     }
+
+    pub fn fail(&mut self, message: &str) -> io::Result<()> {
+        self.input.fail(message)
+    }
 }
 
 fn validate_upload(upload: &StageUpload) -> Result<()> {
@@ -272,8 +276,9 @@ pub fn stage_request(
             offset: u64::try_from(upload.offset).map_err(|_| {
                 protocol_error("pipeline upload offset exceeds the control payload")
             })?,
-            nbytes: u64::try_from(upload.bytes.len())
-                .map_err(|_| protocol_error("pipeline upload byte count exceeds the control payload"))?,
+            nbytes: u64::try_from(upload.bytes.len()).map_err(|_| {
+                protocol_error("pipeline upload byte count exceeds the control payload")
+            })?,
             data: upload.bytes.to_vec(),
         });
     }
@@ -343,14 +348,12 @@ impl StageDispatch {
     /// Queues one completed local frame without blocking the scheduler.
     pub fn submit(&self, job: StageJob) -> Result<()> {
         self.jobs.try_send(job).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => Error::execution(
-                ExecutionError::Capacity,
-                "pipeline boundary queue is full",
-            ),
-            mpsc::TrySendError::Disconnected(_) => Error::execution(
-                ExecutionError::Closed,
-                "pipeline boundary worker stopped",
-            ),
+            mpsc::TrySendError::Full(_) => {
+                Error::execution(ExecutionError::Capacity, "pipeline boundary queue is full")
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                Error::execution(ExecutionError::Closed, "pipeline boundary worker stopped")
+            }
         })
     }
 
@@ -467,97 +470,103 @@ pub unsafe fn serve_stage(
     let mut output =
         output.map(|(link, boundary, bytes)| (BoundaryProducer::new(link), boundary, bytes));
 
-    loop {
-        match worker.receive().map_err(boundary_error)? {
-            StageEvent::Execute {
-                fence,
-                slot,
-                nbytes,
-                request,
-            } => {
-                if nbytes != input_bytes {
-                    return Err(Error::execution(
-                        ExecutionError::State,
-                        "pipeline activation size differs from the prepared boundary",
-                    ));
-                }
-                let Some(buffer) = host.get_mut(slot) else {
-                    return Err(Error::execution(
-                        ExecutionError::State,
-                        "pipeline activation slot exceeds the prepared boundary",
-                    ));
-                };
-                buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
-
-                let mut uploads = Vec::with_capacity(request.uploads.len() + 1);
-                uploads.push(Upload {
-                    buffer: input_boundary.buffer.as_str(),
-                    offset: slot * input_bytes,
-                    bytes: &buffer.bytes()[..nbytes],
-                });
-                for upload in &request.uploads {
-                    if upload.buffer == input_boundary.buffer {
+    let result = (|| -> Result<()> {
+        loop {
+            match worker.receive().map_err(boundary_error)? {
+                StageEvent::Execute {
+                    fence,
+                    slot,
+                    nbytes,
+                    request,
+                } => {
+                    if nbytes != input_bytes {
                         return Err(Error::execution(
                             ExecutionError::State,
-                            "pipeline request uploads its boundary activation twice",
+                            "pipeline activation size differs from the prepared boundary",
                         ));
                     }
-                    let offset = usize::try_from(upload.offset).map_err(|_| {
-                        Error::execution(
+                    let Some(buffer) = host.get_mut(slot) else {
+                        return Err(Error::execution(
                             ExecutionError::State,
-                            "pipeline upload offset exceeds host address space",
-                        )
-                    })?;
-                    uploads.push(Upload {
-                        buffer: upload.buffer.as_str(),
-                        offset,
-                        bytes: &upload.data,
-                    });
-                }
-                let graph = usize::try_from(request.graph).map_err(|_| {
-                    Error::execution(
-                        ExecutionError::State,
-                        "pipeline stage graph index exceeds host address space",
-                    )
-                })?;
-                if executor.submit(graph, &uploads, false)?.is_none() {
-                    return Err(Error::execution(
-                        ExecutionError::State,
-                        "pipeline stage executor reported backpressure after a completed frame",
-                    ));
-                }
-                let completion = loop {
-                    if let Some(completion) = executor.poll()? {
-                        break completion;
-                    }
-                    std::thread::yield_now();
-                };
+                            "pipeline activation slot exceeds the prepared boundary",
+                        ));
+                    };
+                    buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
 
-                if let Some((producer, boundary, bytes)) = output.as_mut() {
-                    let offset = slot.checked_mul(*bytes).ok_or_else(|| {
+                    let mut uploads = Vec::with_capacity(request.uploads.len() + 1);
+                    uploads.push(Upload {
+                        buffer: input_boundary.buffer.as_str(),
+                        offset: slot * input_bytes,
+                        bytes: &buffer.bytes()[..nbytes],
+                    });
+                    for upload in &request.uploads {
+                        if upload.buffer == input_boundary.buffer {
+                            return Err(Error::execution(
+                                ExecutionError::State,
+                                "pipeline request uploads its boundary activation twice",
+                            ));
+                        }
+                        let offset = usize::try_from(upload.offset).map_err(|_| {
+                            Error::execution(
+                                ExecutionError::State,
+                                "pipeline upload offset exceeds host address space",
+                            )
+                        })?;
+                        uploads.push(Upload {
+                            buffer: upload.buffer.as_str(),
+                            offset,
+                            bytes: &upload.data,
+                        });
+                    }
+                    let graph = usize::try_from(request.graph).map_err(|_| {
                         Error::execution(
                             ExecutionError::State,
-                            "pipeline boundary slot offset exceeds host address space",
+                            "pipeline stage graph index exceeds host address space",
                         )
                     })?;
-                    executor.read_buffer_range(&boundary.buffer, buffer, offset, *bytes)?;
-                    producer
-                        .publish(fence, &buffer.bytes()[..*bytes])
-                        .map_err(boundary_error)?;
-                    producer.wait_release(fence).map_err(boundary_error)?;
-                    worker.release(fence).map_err(boundary_error)?;
-                } else {
-                    let payload = super::stage_completion::encode(&completion)?;
-                    worker
-                        .commit_with(fence, &payload)
-                        .map_err(boundary_error)?;
+                    if executor.submit(graph, &uploads, false)?.is_none() {
+                        return Err(Error::execution(
+                            ExecutionError::State,
+                            "pipeline stage executor reported backpressure after a completed frame",
+                        ));
+                    }
+                    let completion = loop {
+                        if let Some(completion) = executor.poll()? {
+                            break completion;
+                        }
+                        std::thread::yield_now();
+                    };
+
+                    if let Some((producer, boundary, bytes)) = output.as_mut() {
+                        let offset = slot.checked_mul(*bytes).ok_or_else(|| {
+                            Error::execution(
+                                ExecutionError::State,
+                                "pipeline boundary slot offset exceeds host address space",
+                            )
+                        })?;
+                        executor.read_buffer_range(&boundary.buffer, buffer, offset, *bytes)?;
+                        producer
+                            .publish(fence, &buffer.bytes()[..*bytes])
+                            .map_err(boundary_error)?;
+                        producer.wait_release(fence).map_err(boundary_error)?;
+                        worker.release(fence).map_err(boundary_error)?;
+                    } else {
+                        let payload = super::stage_completion::encode(&completion)?;
+                        worker
+                            .commit_with(fence, &payload)
+                            .map_err(boundary_error)?;
+                    }
                 }
+                StageEvent::Cancel { .. } => {}
+                StageEvent::Drain => break,
             }
-            StageEvent::Cancel { .. } => {}
-            StageEvent::Drain => break,
         }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        let _ = worker.fail(&error.to_string());
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
