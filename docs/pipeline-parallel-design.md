@@ -147,7 +147,11 @@ context alive until drain.
 
 Stage zero remains the only scheduler and packer. It constructs per-stage input
 packing from each stage's graph contract and execution manifest, then sends
-buffer-name/offset/byte uploads. Remote stages do not run the scheduler.
+buffer-name/offset/byte uploads. Remote stages do not run the scheduler. A
+dedicated boundary thread publishes completed local frames and returns committed
+completions to the worker. The first implementation serializes jobs on one
+boundary and admits one local frame at a time; `activation_slots` prepares the
+ring capacity, while overlapping boundary batches remain a later change.
 
 ## MTP
 
@@ -187,8 +191,9 @@ scratch. Multimodal prefix identity and snapshot semantics are unchanged.
 
 ## Scheduling
 
-The scheduler gains an in-flight window of `activation_slots`, carried as
-`PolicyConfig::max_inflight` and set from the package's pipeline contract:
+The scheduler exposes `PolicyConfig::max_inflight`. M1 sets it to one because
+boundary publication is serialized; the later indexed ring admits
+`activation_slots` independent batches:
 
 - Prefill chunks with fixed positions may fill the window.
 - Independent decode or speculative batches for different requests may fill it.

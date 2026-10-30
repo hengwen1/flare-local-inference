@@ -100,6 +100,10 @@ pub struct ModelConfig {
     pub decode_weight_bytes: u64,
     pub history_drafts: bool,
     pub speculative_proposal_source: crate::scheduler::speculation::ProposalSource,
+    /// Global pipeline layout, present on stage zero of a pipeline package.
+    pub pipeline: Option<crate::model::contract::PipelineContract>,
+    /// This host's stage index in `pipeline`.
+    pub pipeline_stage: u32,
 }
 
 #[cfg_attr(feature = "server", derive(serde::Serialize, serde::Deserialize))]

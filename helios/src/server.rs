@@ -166,6 +166,7 @@ impl Server {
         images: Option<ImageProcessor>,
         config: ServerConfig,
         peers: Option<crate::execution::RankPeers>,
+        pipeline: Option<crate::execution::boundary::BoundaryLink>,
     ) -> std::result::Result<Self, StartFailure> {
         if model.contract.vision.enabled() != images.is_some() {
             return Err("image processor must match prepared vision capabilities".into());
@@ -198,6 +199,7 @@ impl Server {
                 frontend.clone(),
                 peers,
                 config.scheduling_policy,
+                pipeline,
             )?
         });
         let state = Arc::new(HttpState {

@@ -228,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let shape = cluster::Shape::from_flags(args.roce_ring, args.roce_chain);
-    let rendezvous = args.rendezvous;
+    let rendezvous = args.rendezvous.clone();
     // SAFETY: The trusted package owners remain live until every rank drains.
     let owner = unsafe {
         NativeModel::load_agreeing(
@@ -243,10 +243,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
     };
     if owner.pipeline().is_some() {
-        return Err(
-            "pipeline-parallel packages require the stage worker, which this build does not provide"
-                .into(),
-        );
+        let result = serve_pipeline(owner, membership, &args, bind, key, progress, shape);
+        #[cfg(unix)]
+        if let Some(peers) = launched {
+            peers.finish().map_err(|e| e.to_string())?;
+        }
+        return result;
     }
     let cluster = match (owner.cluster().cloned(), membership, rendezvous) {
         (Some(cluster), Some(membership), Some(address)) => Some((cluster, membership, address)),
@@ -278,12 +280,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     config["api_key"] = key.into();
     phase.finish(config["model_id"].as_str().unwrap_or_default());
-    serve(owner, config, progress, cluster, shape)?;
+    serve(owner, config, progress, cluster, shape, None)?;
     #[cfg(unix)]
     if let Some(peers) = launched {
         peers.finish().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn serve_pipeline(
+    owner: NativeModel,
+    membership: Option<cluster::Membership>,
+    args: &cli::Run,
+    bind: std::net::SocketAddr,
+    key: String,
+    mut progress: StartupProgress,
+    shape: cluster::Shape,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use flare_helios::execution::boundary::BoundaryLink;
+
+    let pipeline = owner
+        .pipeline()
+        .cloned()
+        .ok_or("pipeline package lost its layout")?;
+    if pipeline.stages != 2 {
+        return Err("this pipeline build supports exactly two stages".into());
+    }
+    let rank = owner
+        .cluster()
+        .ok_or("pipeline package requires cluster membership")?
+        .rank;
+    match (rank, membership) {
+        (1, Some(cluster::Membership::Peer(stream))) => {
+            let link = BoundaryLink::from_rank_stream(stream)?;
+            let boundary = pipeline
+                .boundary
+                .first()
+                .cloned()
+                .ok_or("pipeline package has no boundary")?;
+            let mut manifests = owner.manifests()?;
+            let manifest = manifests
+                .pop()
+                .ok_or("pipeline stage has no execution manifest")?;
+            // SAFETY: The package owner retains every prepared graph, buffer, and
+            // context until the stage worker drains and returns.
+            unsafe {
+                flare_helios::execution::pipeline::serve_stage(manifest, link, boundary, None)?;
+            }
+            Ok(())
+        }
+        (0, Some(cluster::Membership::Zero(mut streams))) => {
+            if streams.len() != 1 {
+                return Err("two-stage pipeline requires exactly one peer".into());
+            }
+            let link = BoundaryLink::from_rank_stream(streams.remove(0))?;
+            let phase = progress.phase("Read model configuration", None);
+            let mut config = owner.server_config().clone();
+            config["bind"] = bind.to_string().into();
+            if let Some(alpha) = args.serving.mtp_adaptive_verification_alpha {
+                config["mtp_adaptive_verification_alpha"] = alpha.into();
+            }
+            config["scheduler_policy"] = args.scheduler_policy.clone().into();
+            if let Some(value) = args.scheduler_terminal_value {
+                config["scheduler_terminal_value"] = value.into();
+            }
+            if let Some(price) = args.scheduler_terminal_age_price {
+                config["scheduler_terminal_age_price"] = price.into();
+            }
+            if let Some(name) = args.served_model_name.clone() {
+                config["served_names"] = serde_json::json!([name]);
+            }
+            config["api_key"] = key.into();
+            phase.finish(config["model_id"].as_str().unwrap_or_default());
+            serve(owner, config, progress, None, shape, Some(link))
+        }
+        _ => Err("pipeline package rank does not match its joined cluster".into()),
+    }
 }
 
 fn configure_package_devices(
@@ -540,6 +612,7 @@ fn serve(
         Vec<flare_helios::execution::RankStream>,
     )>,
     shape: cluster::Shape,
+    pipeline: Option<flare_helios::execution::boundary::BoundaryLink>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: This executable loads a trusted package and retains its resources
     // until the native server confirms every replay stream has drained.
@@ -560,9 +633,6 @@ fn serve(
             .then_some(flare_helios::execution::RankPeers::Threads(manifests)),
     };
     let mut bootstrap = Bootstrap::load(&config.to_string(), &manifest)?;
-    if let Some(pipeline) = owner.pipeline() {
-        bootstrap.server.scheduling_policy.max_inflight = pipeline.activation_slots as usize;
-    }
     phase.finish(format!(
         "{} token vocabulary",
         bootstrap.model.contract.vocabulary
@@ -577,6 +647,7 @@ fn serve(
             bootstrap.images,
             bootstrap.server,
             peers,
+            pipeline,
         )
     } {
         Ok(server) => server,

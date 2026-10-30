@@ -46,6 +46,8 @@ pub(super) fn config() -> ModelConfig {
         decode_weight_bytes: 0,
         history_drafts: true,
         speculative_proposal_source: Default::default(),
+        pipeline: None,
+        pipeline_stage: 0,
     }
 }
 

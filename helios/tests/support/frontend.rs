@@ -100,5 +100,7 @@ pub fn model_config(contract: crate::model::PreparedContract) -> crate::model::M
         decode_weight_bytes: 0,
         history_drafts: false,
         speculative_proposal_source: Default::default(),
+        pipeline: None,
+        pipeline_stage: 0,
     }
 }

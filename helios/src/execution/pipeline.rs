@@ -5,8 +5,10 @@
 //! following `DATA` frame, so large tensors never pass through this encoding.
 
 use std::io;
+use std::sync::mpsc;
+
 use super::boundary::{BoundaryConsumer, BoundaryEvent, BoundaryLink, BoundaryProducer};
-use super::{ExecutionManifest, RankExecutor, Upload};
+use super::{ExecutionManifest, FrameCompletion, RankExecutor, Upload};
 use crate::{Error, ExecutionError, Result};
 
 const VERSION: u32 = 1;
@@ -281,11 +283,88 @@ pub fn stage_request(
     })
 }
 
+/// One stage-zero job waiting for boundary publication.
+pub struct StageJob {
+    pub fence: u64,
+    pub request: StageRequest,
+    pub activation: Vec<u8>,
+}
+
+/// Serial publisher for one stage-zero boundary.
+///
+/// The scheduler hands over completed local frames; this worker publishes the
+/// control payload and activation, then waits for the final stage's committed
+/// completion. Stage zero polls `next_completion` from its normal worker loop.
+pub struct StageDispatch {
+    jobs: mpsc::SyncSender<StageJob>,
+    completions: mpsc::Receiver<Result<FrameCompletion>>,
+}
+
+impl StageDispatch {
+    pub fn start(mut producer: BoundaryProducer, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "pipeline dispatch requires at least one activation slot",
+            ));
+        }
+        let (jobs, receiver) = mpsc::sync_channel::<StageJob>(capacity);
+        let (sender, completions) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("flare-pipeline-boundary".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let result = (|| {
+                        let prepare = job.request.encode()?;
+                        producer
+                            .publish_prepared(job.fence, &prepare, &job.activation)
+                            .map_err(boundary_error)?;
+                        let mut payload = Vec::new();
+                        producer
+                            .wait_commit(job.fence, &mut payload)
+                            .map_err(boundary_error)?;
+                        super::stage_completion::decode(job.fence, &payload)
+                    })();
+                    let failed = result.is_err();
+                    if sender.send(result).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| {
+                Error::execution(
+                    ExecutionError::State,
+                    format!("cannot start pipeline boundary worker: {error}"),
+                )
+            })?;
+        Ok(Self { jobs, completions })
+    }
+
+    /// Queues one completed local frame without blocking the scheduler.
+    pub fn submit(&self, job: StageJob) -> Result<()> {
+        self.jobs.try_send(job).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => Error::execution(
+                ExecutionError::Capacity,
+                "pipeline boundary queue is full",
+            ),
+            mpsc::TrySendError::Disconnected(_) => Error::execution(
+                ExecutionError::Closed,
+                "pipeline boundary worker stopped",
+            ),
+        })
+    }
+
+    /// Returns one final-stage completion if the boundary worker finished one.
+    pub fn next_completion(&self) -> Option<Result<FrameCompletion>> {
+        self.completions.try_recv().ok()
+    }
+}
+
 fn boundary_error(error: impl std::fmt::Display) -> Error {
     Error::execution(ExecutionError::State, format!("pipeline boundary: {error}"))
 }
 
-fn boundary_bytes(boundary: &crate::model::contract::PipelineBoundary) -> Result<usize> {
+pub(crate) fn boundary_bytes(boundary: &crate::model::contract::PipelineBoundary) -> Result<usize> {
     let element = match boundary.dtype.as_str() {
         "bf16" | "f16" => 2,
         "f32" => 4,
@@ -541,6 +620,66 @@ mod tests {
         let mut encoded = request().encode().unwrap();
         encoded[..4].copy_from_slice(&2u32.to_be_bytes());
         assert!(StageRequest::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn stage_dispatch_publishes_jobs_and_returns_committed_completions() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || BoundaryLink::connect(address).unwrap());
+        let server = BoundaryLink::accept(&listener).unwrap();
+        let client = client.join().unwrap();
+        let producer = BoundaryProducer::new(server);
+        let mut consumer = BoundaryConsumer::new(client, 1);
+        let dispatch = StageDispatch::start(producer, 1).unwrap();
+
+        let completion = FrameCompletion {
+            fence: crate::cache::Fence(3),
+            graph_index: 1,
+            timing: crate::execution::ExecutionTiming::default(),
+            records: [crate::execution::CompletionRecord {
+                vector: Some(crate::execution::TokenVector::default()),
+                ..Default::default()
+            }]
+            .into(),
+            logprobs: None,
+            prompt_logprobs: None,
+            proposal_confidence: None,
+            speculative_survival: None,
+        };
+        let payload = crate::execution::stage_completion::encode(&completion).unwrap();
+        let receiving = std::thread::spawn(move || {
+            let mut prepare = Vec::new();
+            let mut activation = Vec::new();
+            assert!(matches!(
+                consumer
+                    .receive_prepared_into(&mut prepare, &mut activation)
+                    .unwrap(),
+                BoundaryEvent::Data(crate::execution::boundary::BoundaryData { fence: 3, .. })
+            ));
+            assert_eq!(activation, [7, 8]);
+            consumer.commit_with(3, &payload).unwrap();
+        });
+
+        dispatch
+            .submit(StageJob {
+                fence: 3,
+                request: StageRequest::new(4, vec![]),
+                activation: vec![7, 8],
+            })
+            .unwrap();
+        let decoded = loop {
+            if let Some(result) = dispatch.next_completion() {
+                break result.unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(decoded.fence, crate::cache::Fence(3));
+        assert_eq!(decoded.graph_index, 1);
+        receiving.join().unwrap();
     }
 
     #[test]

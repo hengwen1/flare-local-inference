@@ -118,6 +118,18 @@ impl BoundaryLink {
         Self::new(stream)
     }
 
+    /// Adopts a TCP rank stream as a pipeline boundary link.
+    pub fn from_rank_stream(stream: super::RankStream) -> io::Result<Self> {
+        match stream {
+            super::RankStream::Tcp(stream) => Self::new(stream),
+            #[cfg(unix)]
+            super::RankStream::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pipeline boundaries require TCP rank streams",
+            )),
+        }
+    }
+
     pub fn set_max_payload(&mut self, max_payload: usize) {
         self.max_payload = max_payload;
     }

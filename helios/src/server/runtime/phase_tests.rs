@@ -89,6 +89,8 @@ impl Fixture {
                 decode_weight_bytes: 0,
                 history_drafts: false,
                 speculative_proposal_source: Default::default(),
+        pipeline: None,
+        pipeline_stage: 0,
             },
             frontend,
             stop: AtomicBool::new(false),

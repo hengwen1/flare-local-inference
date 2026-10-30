@@ -60,6 +60,18 @@ impl Bootstrap {
                 })
         };
         let identity = text("identity")?;
+        let pipeline = object
+            .get("pipeline")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| {
+                crate::ExecutionError::Manifest(crate::Failure::caused_by(
+                    "invalid prepared pipeline layout",
+                    error,
+                ))
+            })?;
+        let pipeline_stage = u32::try_from(integer("pipeline_stage", Some(0))?)
+            .map_err(|_| "pipeline stage index exceeds integer range")?;
         let frontend_settings: FrontendSettings = serde_json::from_value(
             object
                 .get("frontend")
@@ -185,6 +197,8 @@ impl Bootstrap {
                     _ => return Err("speculative_proposal_source must be mtp or copy".into()),
                 },
             )?,
+            pipeline,
+            pipeline_stage,
             speculative_widths: object
                 .get("speculative_widths")
                 .map(|v| {

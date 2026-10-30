@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +13,10 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use crate::{
     AdmissionError, Error, ExecutionError, Failure, Result, Shutdown,
     cache::ConditioningEvent,
-    execution::{ExecutionManifest, GraphKind, RankExecutor, SamplingMode},
+    execution::{
+        ExecutionManifest, GraphKind, RankExecutor, SamplingMode,
+        pipeline::{StageDispatch, StageJob, boundary_bytes, select_stage_graph, stage_request},
+    },
     model::{ModelConfig, SamplingParameters},
     scheduler::{
         RequestHandle, RequestPhase, RequestScheduler, RequestSpec, ScheduledPlan, ScheduledStep,
@@ -332,8 +335,43 @@ impl ModelRuntime {
         frontend: Arc<crate::frontend::Frontend>,
         peers: Option<crate::execution::RankPeers>,
         policy: crate::scheduler::PolicyConfig,
+        pipeline: Option<crate::execution::boundary::BoundaryLink>,
     ) -> Result<Self> {
         crate::model::catalog::validate(&config, &manifest)?;
+        let policy = if config.pipeline.is_some() {
+            crate::scheduler::PolicyConfig {
+                max_inflight: 1,
+                ..policy
+            }
+        } else {
+            policy
+        };
+        let (dispatch, stage_boundary) = match (config.pipeline.as_ref(), pipeline) {
+            (Some(layout), Some(link)) => {
+                let stage = config.pipeline_stage as usize;
+                if stage + 1 >= layout.stages as usize {
+                    return Err("pipeline server must not be the final stage".into());
+                }
+                let boundary = layout.boundary.get(stage).ok_or_else(|| {
+                    "pipeline stage has no outgoing boundary".to_string()
+                })?;
+                let bytes = boundary_bytes(boundary)?;
+                (
+                    Some(StageDispatch::start(
+                        crate::execution::boundary::BoundaryProducer::new(link),
+                        layout.activation_slots as usize,
+                    )?),
+                    Some((boundary.buffer.clone(), bytes)),
+                )
+            }
+            (Some(_), None) => {
+                return Err("pipeline package requires a boundary link".into());
+            }
+            (None, Some(_)) => {
+                return Err("boundary link requires a pipeline package".into());
+            }
+            (None, None) => (None, None),
+        };
         super::observation::initialize_clock();
         if queue_capacity == 0 || queue_capacity > 1024 || !(2..=4096).contains(&event_capacity) {
             return Err("invalid native request/event queue capacity".into());
@@ -510,6 +548,8 @@ impl ModelRuntime {
                     scheduler,
                     receiver,
                     queue_capacity,
+                    dispatch,
+                    stage_boundary,
                 );
                 worker.attach_store(store);
                 if worker.config.contract.vision.enabled() {
@@ -846,6 +886,11 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    dispatch: Option<StageDispatch>,
+    stage_boundary: Option<(String, usize)>,
+    stage_host: Option<crate::cuda::PinnedHost>,
+    stage_jobs: BTreeMap<crate::cache::Fence, crate::execution::pipeline::StageRequest>,
+    stage_kinds: BTreeMap<crate::cache::Fence, GraphKind>,
 }
 
 impl<'a> Worker<'a> {
@@ -857,6 +902,8 @@ impl<'a> Worker<'a> {
         scheduler: RequestScheduler,
         receiver: mpsc::Receiver<Vec<Incoming>>,
         queue_capacity: usize,
+        dispatch: Option<StageDispatch>,
+        stage_boundary: Option<(String, usize)>,
     ) -> Self {
         Self {
             config,
@@ -879,21 +926,34 @@ impl<'a> Worker<'a> {
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
+            dispatch,
+            stage_boundary,
+            stage_host: None,
+            stage_jobs: BTreeMap::new(),
+            stage_kinds: BTreeMap::new(),
         }
     }
 
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
         // Input construction stays inside the worker's unwind and drain boundary.
         self.inputs = Some(crate::model::Inputs::new(self.config, executor.manifest())?);
+        if let Some((_, bytes)) = &self.stage_boundary {
+            self.stage_host = Some(executor.host_buffer(*bytes)?);
+        }
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
             };
             if let Some(completion) = executor.poll()? {
-                let kind = executor.manifest().graphs[completion.graph_index].kind;
-                self.complete(kind, completion)?;
+                if let Some(request) = self.stage_jobs.remove(&completion.fence) {
+                    self.publish_stage(executor, completion.fence, request)?;
+                } else {
+                    let kind = executor.manifest().graphs[completion.graph_index].kind;
+                    self.complete(kind, completion)?;
+                }
                 progress = true;
             }
+            progress |= self.poll_stage()?;
             progress |= self.publish()?;
             progress |= self.service_store()?;
             let (step, planned) = self.plan(executor.outstanding())?;
@@ -1809,6 +1869,55 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
+    /// Publishes one completed stage-zero frame to the next stage.
+    fn publish_stage(
+        &mut self,
+        executor: &mut RankExecutor,
+        fence: crate::cache::Fence,
+        request: crate::execution::pipeline::StageRequest,
+    ) -> Result<()> {
+        let (buffer, bytes) = self
+            .stage_boundary
+            .as_ref()
+            .ok_or("pipeline stage has no outgoing boundary")?;
+        let host = self
+            .stage_host
+            .as_ref()
+            .ok_or("pipeline stage has no pinned boundary storage")?;
+        executor.read_buffer_range(buffer, host, 0, *bytes)?;
+        let activation = host.bytes()[..*bytes].to_vec();
+        self.dispatch
+            .as_ref()
+            .ok_or("pipeline stage has no boundary dispatcher")?
+            .submit(StageJob {
+                fence: fence.0,
+                request,
+                activation,
+            })
+    }
+
+    /// Delivers final-stage completions to the scheduler.
+    fn poll_stage(&mut self) -> Result<bool> {
+        let Some(dispatch) = &self.dispatch else {
+            return Ok(false);
+        };
+        let mut completed = Vec::new();
+        while let Some(result) = dispatch.next_completion() {
+            completed.push(result);
+        }
+        let mut progress = false;
+        for result in completed {
+            let completion = result?;
+            let kind = self
+                .stage_kinds
+                .remove(&completion.fence)
+                .ok_or("pipeline completion has no submitted stage step")?;
+            self.complete(kind, completion)?;
+            progress = true;
+        }
+        Ok(progress)
+    }
+
     fn submit(&mut self, executor: &mut RankExecutor, step: &ScheduledPlan) -> Result<bool> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -1904,6 +2013,38 @@ impl<'a> Worker<'a> {
                 });
             }
         }
+        let stage_request = match self.config.pipeline.as_ref() {
+            Some(layout)
+                if matches!(
+                    step.kind,
+                    GraphKind::Prefill
+                        | GraphKind::ScoredPrefill
+                        | GraphKind::Decode
+                        | GraphKind::Speculative
+                        | GraphKind::Mixed
+                ) =>
+            {
+                let stage = self.config.pipeline_stage as usize;
+                let remote = layout
+                    .stage
+                    .get(stage + 1)
+                    .ok_or("pipeline stage has no consumer")?;
+                let boundary = layout
+                    .boundary
+                    .get(stage)
+                    .ok_or("pipeline stage has no outgoing boundary")?;
+                let inputs = remote
+                    .inputs
+                    .iter()
+                    .filter(|name| **name != boundary.buffer)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let remote_graph =
+                    select_stage_graph(remote, &executor.manifest().graphs[graph].name)?;
+                Some(stage_request(remote_graph, &uploads, &inputs)?)
+            }
+            _ => None,
+        };
         if executor.submit(
             graph,
             &uploads,
@@ -1911,6 +2052,10 @@ impl<'a> Worker<'a> {
         )? != Some(fence)
         {
             return Err("executor refused a reserved scheduler submission".into());
+        }
+        if let Some(request) = stage_request {
+            self.stage_jobs.insert(fence, request);
+            self.stage_kinds.insert(fence, step.kind);
         }
         observe_submission(self.metrics, &self.scheduler, step, executor.outstanding())?;
         self.metrics

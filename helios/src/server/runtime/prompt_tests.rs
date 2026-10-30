@@ -26,7 +26,7 @@ fn prompt_prefill_gpu_and_native_costs() {
         "page_tokens":config.contract.cache.page_tokens,"graphs":manifest.graphs.len()}));
     let scoring = manifest.prompt_logprob_capacity().unwrap() > 0;
     let runtime = unsafe { ModelRuntime::start(manifest, config, 16, 256, frontend,
-        None, crate::scheduler::PolicyConfig::default()).unwrap() };
+        None, crate::scheduler::PolicyConfig::default(), None).unwrap() };
     runtime.metrics().scheduler_trace.start();
     let asynchronous = tokio::runtime::Runtime::new().unwrap();
     let mut samples = VecDeque::new();

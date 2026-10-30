@@ -466,6 +466,9 @@ impl NativeModel {
             let stage = prepared.stage_view(cluster.rank)?;
             server_config["model_contract"] = serde_json::to_value(&stage)
                 .map_err(|error| invalid(format!("invalid stage contract: {error}")))?;
+            server_config["pipeline"] = serde_json::to_value(pipeline)
+                .map_err(|error| invalid(format!("invalid pipeline layout: {error}")))?;
+            server_config["pipeline_stage"] = cluster.rank.into();
             stage
         } else {
             prepared
