@@ -301,7 +301,7 @@ pub struct StageJob {
 /// control payload and activation, then waits for the final stage's committed
 /// completion. Stage zero polls `next_completion` from its normal worker loop.
 pub struct StageDispatch {
-    jobs: mpsc::SyncSender<StageJob>,
+    jobs: Option<mpsc::SyncSender<StageJob>>,
     completions: mpsc::Receiver<Result<FrameCompletion>>,
 }
 
@@ -335,6 +335,7 @@ impl StageDispatch {
                         break;
                     }
                 }
+                let _ = producer.drain();
             })
             .map_err(|error| {
                 Error::execution(
@@ -342,12 +343,18 @@ impl StageDispatch {
                     format!("cannot start pipeline boundary worker: {error}"),
                 )
             })?;
-        Ok(Self { jobs, completions })
+        Ok(Self {
+            jobs: Some(jobs),
+            completions,
+        })
     }
 
     /// Queues one completed local frame without blocking the scheduler.
     pub fn submit(&self, job: StageJob) -> Result<()> {
-        self.jobs.try_send(job).map_err(|error| match error {
+        let jobs = self.jobs.as_ref().ok_or_else(|| {
+            Error::execution(ExecutionError::Closed, "pipeline boundary worker stopped")
+        })?;
+        jobs.try_send(job).map_err(|error| match error {
             mpsc::TrySendError::Full(_) => {
                 Error::execution(ExecutionError::Capacity, "pipeline boundary queue is full")
             }
@@ -360,6 +367,12 @@ impl StageDispatch {
     /// Returns one final-stage completion if the boundary worker finished one.
     pub fn next_completion(&self) -> Option<Result<FrameCompletion>> {
         self.completions.try_recv().ok()
+    }
+}
+
+impl Drop for StageDispatch {
+    fn drop(&mut self) {
+        self.jobs.take();
     }
 }
 
@@ -573,6 +586,17 @@ pub unsafe fn serve_stage(
 mod tests {
     use super::*;
 
+    fn pair() -> (
+        super::super::boundary::BoundaryLink,
+        super::super::boundary::BoundaryLink,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || BoundaryLink::connect(address).unwrap());
+        let server = BoundaryLink::accept(&listener).unwrap();
+        (client.join().unwrap(), server)
+    }
+
     fn request() -> StageRequest {
         StageRequest::new(
             3,
@@ -629,6 +653,22 @@ mod tests {
         let mut encoded = request().encode().unwrap();
         encoded[..4].copy_from_slice(&2u32.to_be_bytes());
         assert!(StageRequest::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn dropping_stage_dispatch_drains_the_boundary() {
+        let (producer, consumer) = pair();
+        let dispatch = StageDispatch::start(BoundaryProducer::new(producer), 1).unwrap();
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let draining = std::thread::spawn(move || {
+            let mut payload = Vec::new();
+            matches!(
+                consumer.receive_into(&mut payload).unwrap(),
+                BoundaryEvent::Drain
+            )
+        });
+        drop(dispatch);
+        assert!(draining.join().unwrap());
     }
 
     #[test]
