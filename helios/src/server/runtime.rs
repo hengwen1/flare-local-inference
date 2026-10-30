@@ -875,6 +875,32 @@ impl Drop for ImagePreparation {
     }
 }
 
+fn pipeline_remote_operation(kind: GraphKind) -> bool {
+    matches!(
+        kind,
+        GraphKind::Init
+            | GraphKind::Restore
+            | GraphKind::Snapshot
+            | GraphKind::Resume
+            | GraphKind::Prefill
+            | GraphKind::ScoredPrefill
+            | GraphKind::Decode
+            | GraphKind::Speculative
+            | GraphKind::Mixed
+    )
+}
+
+fn pipeline_activation(kind: GraphKind) -> bool {
+    matches!(
+        kind,
+        GraphKind::Prefill
+            | GraphKind::ScoredPrefill
+            | GraphKind::Decode
+            | GraphKind::Speculative
+            | GraphKind::Mixed
+    )
+}
+
 struct Worker<'a> {
     config: &'a ModelConfig,
     frontend: &'a crate::frontend::Frontend,
@@ -902,8 +928,21 @@ struct Worker<'a> {
     dispatch: Option<StageDispatch>,
     stage_boundary: Option<(String, usize)>,
     stage_host: Option<crate::cuda::PinnedHost>,
-    stage_jobs: BTreeMap<crate::cache::Fence, crate::execution::pipeline::StageRequest>,
+    stage_jobs: BTreeMap<crate::cache::Fence, StagePending>,
+    stage_locals: BTreeMap<crate::cache::Fence, crate::execution::FrameCompletion>,
     stage_kinds: BTreeMap<crate::cache::Fence, (GraphKind, usize)>,
+}
+
+struct StagePending {
+    request: crate::execution::pipeline::StageRequest,
+    activation: StageActivation,
+    local_completion: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageActivation {
+    Boundary,
+    Zero,
 }
 
 impl<'a> Worker<'a> {
@@ -943,6 +982,7 @@ impl<'a> Worker<'a> {
             stage_boundary,
             stage_host: None,
             stage_jobs: BTreeMap::new(),
+            stage_locals: BTreeMap::new(),
             stage_kinds: BTreeMap::new(),
         }
     }
@@ -958,8 +998,12 @@ impl<'a> Worker<'a> {
                 return Ok(());
             };
             if let Some(completion) = executor.poll()? {
-                if let Some(request) = self.stage_jobs.remove(&completion.fence) {
-                    self.publish_stage(executor, completion.fence, request)?;
+                if let Some(pending) = self.stage_jobs.remove(&completion.fence) {
+                    let fence = completion.fence;
+                    if pending.local_completion {
+                        self.stage_locals.insert(fence, completion);
+                    }
+                    self.publish_stage(executor, fence, pending)?;
                 } else {
                     let kind = executor.manifest().graphs[completion.graph_index].kind;
                     self.complete(kind, completion)?;
@@ -1887,7 +1931,7 @@ impl<'a> Worker<'a> {
         &mut self,
         executor: &mut RankExecutor,
         fence: crate::cache::Fence,
-        request: crate::execution::pipeline::StageRequest,
+        pending: StagePending,
     ) -> Result<()> {
         let (buffer, bytes) = self
             .stage_boundary
@@ -1895,16 +1939,21 @@ impl<'a> Worker<'a> {
             .ok_or("pipeline stage has no outgoing boundary")?;
         let host = self
             .stage_host
-            .as_ref()
+            .as_mut()
             .ok_or("pipeline stage has no pinned boundary storage")?;
-        executor.read_buffer_range(buffer, host, 0, *bytes)?;
+        match pending.activation {
+            StageActivation::Boundary => {
+                executor.read_buffer_range(buffer, host, 0, *bytes)?;
+            }
+            StageActivation::Zero => host.bytes_mut()[..*bytes].fill(0),
+        }
         let activation = host.bytes()[..*bytes].to_vec();
         self.dispatch
             .as_ref()
             .ok_or("pipeline stage has no boundary dispatcher")?
             .submit(StageJob {
                 fence: fence.0,
-                request,
+                request: pending.request,
                 activation,
             })
     }
@@ -1920,15 +1969,18 @@ impl<'a> Worker<'a> {
         }
         let mut progress = false;
         for result in completed {
-            let completion = result?;
+            let remote = result?;
             let (kind, graph) = self
                 .stage_kinds
-                .remove(&completion.fence)
+                .remove(&remote.fence)
                 .ok_or("pipeline completion has no submitted stage step")?;
+            let mut completion = self
+                .stage_locals
+                .remove(&remote.fence)
+                .unwrap_or(remote);
             if completion.records.len() != self.config.limits.request_capacity() {
                 return Err("pipeline completion record count differs from stage zero".into());
             }
-            let mut completion = completion;
             completion.graph_index = graph;
             self.complete(kind, completion)?;
             progress = true;
@@ -2032,16 +2084,7 @@ impl<'a> Worker<'a> {
             }
         }
         let stage_request = match self.config.pipeline.as_ref() {
-            Some(layout)
-                if matches!(
-                    step.kind,
-                    GraphKind::Prefill
-                        | GraphKind::ScoredPrefill
-                        | GraphKind::Decode
-                        | GraphKind::Speculative
-                        | GraphKind::Mixed
-                ) =>
-            {
+            Some(layout) if pipeline_remote_operation(step.kind) => {
                 let stage = self.config.pipeline_stage as usize;
                 let remote = layout
                     .stage
@@ -2072,7 +2115,18 @@ impl<'a> Worker<'a> {
             return Err("executor refused a reserved scheduler submission".into());
         }
         if let Some(request) = stage_request {
-            self.stage_jobs.insert(fence, request);
+            self.stage_jobs.insert(
+                fence,
+                StagePending {
+                    request,
+                    activation: if pipeline_activation(step.kind) {
+                        StageActivation::Boundary
+                    } else {
+                        StageActivation::Zero
+                    },
+                    local_completion: !pipeline_activation(step.kind),
+                },
+            );
             self.stage_kinds.insert(fence, (step.kind, graph));
         }
         observe_submission(self.metrics, &self.scheduler, step, executor.outstanding())?;

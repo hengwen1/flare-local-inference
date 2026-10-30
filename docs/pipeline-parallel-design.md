@@ -212,6 +212,13 @@ waits for every stage's copy fence. Restore validates on every stage before any
 stage commits; a rejection suppresses the commit everywhere. Snapshot-slot
 reuse is acknowledged by every stage before reuse.
 
+In M1, stage zero runs `Init`, `Restore`, `Snapshot`, and `Resume` locally and
+then sends the same prepared request to the next stage with a zeroed activation.
+The local completion is published only after the remote stage acknowledges. A
+remote rejection is fatal and does not roll back the local stage; a dedicated
+command frame with validate-then-commit ordering is required before claiming
+cross-stage atomicity.
+
 Prefix checkpoints remain in memory in this version. Pipeline packages reject
 disk offload configuration explicitly; per-stage offload shards are a later
 change.
