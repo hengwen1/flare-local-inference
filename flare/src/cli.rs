@@ -410,6 +410,7 @@ impl OrbitPush {
             roce_ring: self.roce_ring,
             roce_chain: self.roce_chain,
             rendezvous: None,
+            local_pipeline: false,
             rank: None,
             hosts: Vec::new(),
             agents_file: None,
@@ -583,6 +584,7 @@ impl OrbitRun {
             roce_ring: self.roce_ring,
             roce_chain: self.roce_chain,
             rendezvous: None,
+            local_pipeline: false,
             rank: None,
             hosts: Vec::new(),
             agents_file: None,
@@ -661,6 +663,10 @@ pub struct Run {
     /// Rank zero's rendezvous address: where rank zero listens, or on a peer, where it joins rank zero.
     #[arg(long, value_name = "HOST:PORT", help_heading = "Multi-host options")]
     pub rendezvous: Option<String>,
+
+    /// Run every pipeline stage as a local process over loopback for single-host validation.
+    #[arg(long, help_heading = "Multi-host options")]
+    pub local_pipeline: bool,
 
     /// This host's rank of a multi-host package.
     #[arg(long, value_name = "N", help_heading = "Multi-host options")]
@@ -897,7 +903,9 @@ fn served_model_name(value: &str) -> Result<String, String> {
 }
 
 fn scheduler_coefficient(value: &str) -> Result<f64, String> {
-    value.parse::<f64>().ok()
+    value
+        .parse::<f64>()
+        .ok()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| "scheduler coefficient must be finite and nonnegative".into())
 }
@@ -1151,10 +1159,22 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
-            assert_eq!(effective.scheduler_terminal_value, Some(if explicit { 256.0 } else { 512.0 }));
-            assert_eq!(effective.scheduler_terminal_age_price, Some(if explicit { 0.0 } else { 2.0 }));
-            assert_eq!(orbit.run_args().scheduler_terminal_value, orbit.scheduler_terminal_value);
-            assert_eq!(orbit.run_args().scheduler_terminal_age_price, orbit.scheduler_terminal_age_price);
+            assert_eq!(
+                effective.scheduler_terminal_value,
+                Some(if explicit { 256.0 } else { 512.0 })
+            );
+            assert_eq!(
+                effective.scheduler_terminal_age_price,
+                Some(if explicit { 0.0 } else { 2.0 })
+            );
+            assert_eq!(
+                orbit.run_args().scheduler_terminal_value,
+                orbit.scheduler_terminal_value
+            );
+            assert_eq!(
+                orbit.run_args().scheduler_terminal_age_price,
+                orbit.scheduler_terminal_age_price
+            );
             assert_eq!(
                 effective.mtp_adaptive_verification_alpha,
                 Some(if explicit { 1.0 } else { 0.5 })
@@ -1191,12 +1211,18 @@ mod tests {
         let defaults = run(&["flare", "run", "model"]);
         assert_eq!(defaults.scheduler_terminal_value, None);
         assert_eq!(defaults.scheduler_terminal_age_price, None);
-        for flag in ["--scheduler-terminal-value", "--scheduler-terminal-age-price"] {
+        for flag in [
+            "--scheduler-terminal-value",
+            "--scheduler-terminal-age-price",
+        ] {
             for value in ["0", "0.5", "256", "1024"] {
                 assert!(Cli::try_parse_from(["flare", "run", "model", flag, value]).is_ok());
             }
             for value in ["-1", "NaN", "inf", "garbage"] {
-                assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={value}")]).is_err());
+                assert!(
+                    Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={value}")])
+                        .is_err()
+                );
             }
         }
     }
@@ -1206,6 +1232,23 @@ mod tests {
             panic!("expected run")
         };
         *args
+    }
+
+    #[test]
+    fn local_pipeline_flag_parses_with_a_rank_and_rendezvous() {
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--local-pipeline",
+            "--rank",
+            "1",
+            "--rendezvous",
+            "127.0.0.1:29800",
+        ]);
+        assert!(args.local_pipeline);
+        assert_eq!(args.rank, Some(1));
+        assert_eq!(args.rendezvous.as_deref(), Some("127.0.0.1:29800"));
     }
 
     #[test]

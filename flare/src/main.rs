@@ -125,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     if args.rank.is_some()
         || args.rendezvous.is_some()
+        || args.local_pipeline
         || !args.hosts.is_empty()
         || args.roce_ring
         || args.roce_chain
@@ -148,6 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .api_key(args.api_key_file.as_deref())
         .map_err(|error| error.to_string())?;
     let mut progress = StartupProgress::stderr();
+    #[cfg(unix)]
+    if args.local_pipeline {
+        return local_pipeline(args, configuration, bind, key, progress);
+    }
     #[cfg(unix)]
     let mut launched = None;
     #[cfg(unix)]
@@ -286,6 +291,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         peers.finish().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn local_pipeline(
+    mut args: cli::Run,
+    configuration: config::Configuration,
+    bind: std::net::SocketAddr,
+    key: String,
+    mut progress: StartupProgress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use flare_helios::execution::RankStream;
+
+    if args.stage_only || args.hosts.len() > 0 || args.roce_ring || args.roce_chain {
+        return Err(
+            "--local-pipeline cannot be combined with --hosts, --roce-ring, --roce-chain, or --stage-only"
+                .into(),
+        );
+    }
+    let rank = args.rank.unwrap_or(0);
+    if rank > 1 {
+        return Err("--local-pipeline currently supports only ranks 0 and 1".into());
+    }
+    if args.package.is_none() {
+        return Err("--local-pipeline requires a package path on every rank".into());
+    }
+    let address = args
+        .rendezvous
+        .clone()
+        .ok_or("--local-pipeline requires --rendezvous HOST:PORT")?;
+    args.rank = Some(rank);
+    let listener = if rank == 0 {
+        Some(std::net::TcpListener::bind(&address)?)
+    } else {
+        None
+    };
+    let (root, authorized, publisher, lease) = load_package(&args, &mut progress)?;
+    configuration
+        .apply_model(&mut args.serving, &authorized.model_names()?)
+        .map_err(|error| error.to_string())?;
+    configure_package_devices(&mut args, &authorized, &mut progress)?;
+    let stream = match listener {
+        Some(listener) => {
+            let (stream, _) = listener.accept()?;
+            stream
+        }
+        None => local_connect(&address)?,
+    };
+    stream.set_nodelay(true)?;
+    let stream = RankStream::from(stream);
+    let mut membership = Some(if rank == 0 {
+        cluster::Membership::Zero(vec![stream])
+    } else {
+        cluster::Membership::Peer(stream)
+    });
+    let options = args.load_options();
+    let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
+    // SAFETY: the trusted package owner and local files remain live until serving drains.
+    let owner = unsafe {
+        NativeModel::load_agreeing(
+            authorized,
+            &local_devices,
+            &options,
+            &progress,
+            &mut |local| {
+                membership
+                    .as_mut()
+                    .expect("local pipeline membership initialized")
+                    .agree(local)
+            },
+        )?
+    };
+    let _lease = lease;
+    let _root = root;
+    let _publisher = publisher;
+    if owner.pipeline().is_none() {
+        return Err("--local-pipeline requires a pipeline package".into());
+    }
+    serve_pipeline(
+        owner,
+        membership,
+        &args,
+        bind,
+        key,
+        progress,
+        cluster::Shape::from_flags(false, false),
+    )
+}
+
+#[cfg(unix)]
+fn local_connect(address: &str) -> std::io::Result<std::net::TcpStream> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match std::net::TcpStream::connect(address) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn serve_pipeline(

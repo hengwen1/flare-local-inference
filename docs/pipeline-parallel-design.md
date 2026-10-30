@@ -157,6 +157,13 @@ worker. The first implementation serializes jobs on one boundary and admits one
 local frame at a time; `activation_slots` prepares the ring capacity, while
 overlapping boundary batches remain a later change.
 
+For single-host validation, `--local-pipeline` starts the two stages as separate
+local processes on one Thor. Each process loads its stage bundle directly and
+the rendezvous TCP stream carries capacity agreement and the stage boundary;
+package distribution, RoCE, and agents are bypassed. Both processes select GPU
+0. This validates the stage boundary and state fanout but shares one GPU's
+compute and memory, so it is not a throughput path.
+
 ## MTP
 
 The complete `SPECULATIVE` operation remains one scheduler-visible job. Its

@@ -126,6 +126,14 @@ without a local package: serving bootstrap receives its required ranges over
 CX7, verifies the package and publisher trust, then joins capacity agreement.
 A supplied local peer package must have the same export identity as rank zero.
 
+`flare run PACKAGE --local-pipeline --rank 0 --rendezvous 127.0.0.1:PORT` and
+the matching `--rank 1` command run a two-stage pipeline on one host. Each rank
+loads the package locally and uses the rendezvous TCP stream for capacity
+agreement and the stage boundary; package distribution, RoCE, and agents are
+not used. Both ranks select GPU 0. This is a correctness and integration mode,
+not a performance path: the stages share one GPU and do not add compute or
+memory.
+
 `flare run PACKAGE --hosts PEER1,PEER2,...` runs rank zero locally and starts
 explicitly ordered peer agents. `--hosts` excludes rank zero. Pair the peers
 with `flare agent pair` or reuse Orbit pairings. The head node needs no agent
