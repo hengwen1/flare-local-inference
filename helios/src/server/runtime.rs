@@ -890,7 +890,7 @@ struct Worker<'a> {
     stage_boundary: Option<(String, usize)>,
     stage_host: Option<crate::cuda::PinnedHost>,
     stage_jobs: BTreeMap<crate::cache::Fence, crate::execution::pipeline::StageRequest>,
-    stage_kinds: BTreeMap<crate::cache::Fence, GraphKind>,
+    stage_kinds: BTreeMap<crate::cache::Fence, (GraphKind, usize)>,
 }
 
 impl<'a> Worker<'a> {
@@ -1908,10 +1908,12 @@ impl<'a> Worker<'a> {
         let mut progress = false;
         for result in completed {
             let completion = result?;
-            let kind = self
+            let (kind, graph) = self
                 .stage_kinds
                 .remove(&completion.fence)
                 .ok_or("pipeline completion has no submitted stage step")?;
+            let mut completion = completion;
+            completion.graph_index = graph;
             self.complete(kind, completion)?;
             progress = true;
         }
@@ -2055,7 +2057,7 @@ impl<'a> Worker<'a> {
         }
         if let Some(request) = stage_request {
             self.stage_jobs.insert(fence, request);
-            self.stage_kinds.insert(fence, step.kind);
+            self.stage_kinds.insert(fence, (step.kind, graph));
         }
         observe_submission(self.metrics, &self.scheduler, step, executor.outstanding())?;
         self.metrics
