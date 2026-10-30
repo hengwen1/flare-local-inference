@@ -102,6 +102,7 @@ pub struct BoundaryLink {
 impl BoundaryLink {
     pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
+        stream.set_nonblocking(false)?;
         Ok(Self {
             stream,
             max_payload: MAX_PAYLOAD_BYTES,

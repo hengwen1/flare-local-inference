@@ -1912,6 +1912,9 @@ impl<'a> Worker<'a> {
                 .stage_kinds
                 .remove(&completion.fence)
                 .ok_or("pipeline completion has no submitted stage step")?;
+            if completion.records.len() != self.config.limits.request_capacity() {
+                return Err("pipeline completion record count differs from stage zero".into());
+            }
             let mut completion = completion;
             completion.graph_index = graph;
             self.complete(kind, completion)?;
