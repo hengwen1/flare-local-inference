@@ -515,6 +515,76 @@ impl GraphExecutor {
         })
     }
 
+    /// Copies one prepared buffer into pinned host storage after every submitted
+    /// frame has completed. Pipeline stages use this to publish a boundary
+    /// activation; the caller must release or reuse the buffer only after the
+    /// returned copy has finished.
+    pub(crate) fn read_buffer(&mut self, name: &str, host: &PinnedHost) -> Result<()> {
+        if let Some(error) = &self.poison {
+            return Err(ExecutionError::Poisoned(Failure::caused_by(
+                format!("executor failed: {error}"),
+                error.clone(),
+            ))
+            .into());
+        }
+        if self.outstanding() != 0 {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "cannot read a boundary buffer while frames are outstanding",
+            ));
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
+        let buffer = self.manifest.buffer(name)?;
+        if host.bytes().len() < buffer.nbytes {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "boundary host buffer is smaller than the prepared device buffer",
+            ));
+        }
+        // SAFETY: The manifest retains the device range and the pinned host
+        // buffer outlives the copy. No frame is outstanding, so the source is
+        // stable until the synchronized copy returns.
+        unsafe { resources.copy.download(host, buffer.address, buffer.nbytes)? };
+        resources.copy.synchronize()
+    }
+
+    /// Uploads pinned host storage into one prepared buffer after every
+    /// submitted frame has completed.
+    pub(crate) fn write_buffer(&mut self, name: &str, host: &PinnedHost) -> Result<()> {
+        if let Some(error) = &self.poison {
+            return Err(ExecutionError::Poisoned(Failure::caused_by(
+                format!("executor failed: {error}"),
+                error.clone(),
+            ))
+            .into());
+        }
+        if self.outstanding() != 0 {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "cannot write a boundary buffer while frames are outstanding",
+            ));
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
+        let buffer = self.manifest.buffer(name)?;
+        if host.bytes().len() < buffer.nbytes {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "boundary host buffer is smaller than the prepared device buffer",
+            ));
+        }
+        // SAFETY: The manifest retains the device range and the pinned host
+        // buffer outlives the copy. No frame is outstanding, so the destination
+        // is not concurrently written by a graph.
+        unsafe { resources.model.upload(buffer.address, host, 0, buffer.nbytes)? };
+        resources.model.synchronize()
+    }
+
     /// Validate a coordinated submission without touching CUDA or advancing its fence.
     pub(super) fn validate_submission(
         &mut self,

@@ -88,6 +88,70 @@ impl TryFrom<GraphKind> for GraphOperation {
     any(feature = "frontend", feature = "runtime-package"),
     serde(deny_unknown_fields)
 )]
+pub struct PipelineContract {
+    pub version: u32,
+    pub stages: u32,
+    pub activation_slots: u32,
+    pub embedding_stage: u32,
+    pub sampling_stage: u32,
+    pub mtp_stage: u32,
+    pub stage: Vec<PipelineStage>,
+    pub boundary: Vec<PipelineBoundary>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
+pub struct PipelineStage {
+    pub index: u32,
+    pub first_layer: u32,
+    pub last_layer: u32,
+    pub pages: u64,
+    pub state_rows: u64,
+    pub snapshots: u64,
+    pub graphs: Vec<GraphContract>,
+    pub cache: CacheContract,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub has_vision: bool,
+    pub has_mtp: bool,
+    pub has_head: bool,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
+pub struct PipelineBoundary {
+    pub producer: u32,
+    pub consumer: u32,
+    pub buffer: String,
+    pub dtype: String,
+    pub rows: u64,
+    pub elements: u64,
+    pub slots: u64,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
 pub struct PreparedContract {
     pub version: u32,
     pub vocabulary: usize,
@@ -96,6 +160,9 @@ pub struct PreparedContract {
     pub cache: CacheContract,
     pub graphs: Vec<GraphContract>,
     pub frontend: FrontendContract,
+    /// Present when the package's ranks are pipeline stages. Stage-local graph and
+    /// cache declarations live in `pipeline.stage`; the fields above stay empty.
+    pub pipeline: Option<PipelineContract>,
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +396,147 @@ pub struct ImageSpan {
     pub unscoped_tokens: Vec<u32>,
 }
 
+impl PipelineContract {
+    /// Validate the package-level stage layout before a host selects its stage.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            return Err(
+                "unsupported pipeline contract version; re-export the model package".into(),
+            );
+        }
+        if self.stages < 2 {
+            return Err("pipeline parallelism requires at least two stages".into());
+        }
+        let stages = self.stages as usize;
+        if self.stage.len() != stages {
+            return Err("pipeline stage count differs from its declaration".into());
+        }
+        if self.activation_slots == 0 {
+            return Err("pipeline activation slots must be positive".into());
+        }
+        if self.embedding_stage != 0
+            || self.sampling_stage != self.stages - 1
+            || self.mtp_stage != self.stages - 1
+        {
+            return Err("pipeline embedding, sampling, and MTP stages are misplaced".into());
+        }
+        let mut page_tokens = 0;
+        let mut previous_end = None;
+        for (index, stage) in self.stage.iter().enumerate() {
+            if stage.index as usize != index {
+                return Err("pipeline stages must be contiguous and ordered".into());
+            }
+            if stage.first_layer >= stage.last_layer {
+                return Err("pipeline stages require at least one decoder layer".into());
+            }
+            if index == 0 {
+                if stage.first_layer != 0 {
+                    return Err("the first pipeline stage must start at layer zero".into());
+                }
+            } else if previous_end != Some(stage.first_layer) {
+                return Err("pipeline layer ranges must be contiguous and disjoint".into());
+            }
+            previous_end = Some(stage.last_layer);
+            if stage.pages == 0 || stage.state_rows == 0 || stage.snapshots == 0 {
+                return Err("pipeline stages require page, row, and snapshot capacity".into());
+            }
+            if stage.cache.page_tokens == 0 {
+                return Err("pipeline stages require a positive page geometry".into());
+            }
+            if index == 0 {
+                page_tokens = stage.cache.page_tokens;
+            } else if stage.cache.page_tokens != page_tokens {
+                return Err("pipeline stages must agree on page geometry".into());
+            }
+            if stage.graphs.is_empty() {
+                return Err("pipeline stages require a prepared graph catalog".into());
+            }
+            let mut names = std::collections::HashSet::new();
+            for graph in &stage.graphs {
+                if !names.insert(&graph.graph) {
+                    return Err("pipeline stage graph names must be unique".into());
+                }
+                if graph.kind == GraphOperation::Vision && index != 0 {
+                    return Err("vision graphs belong only to the first pipeline stage".into());
+                }
+            }
+            if stage.has_vision && index != 0 {
+                return Err("vision belongs only to the first pipeline stage".into());
+            }
+            if stage.has_head != (index + 1 == stages) {
+                return Err("the output head belongs only to the last pipeline stage".into());
+            }
+            if stage.has_mtp && index + 1 != stages {
+                return Err("MTP belongs only to the last pipeline stage".into());
+            }
+            if stage
+                .inputs
+                .iter()
+                .chain(&stage.outputs)
+                .any(String::is_empty)
+            {
+                return Err("pipeline boundary buffer names must be nonempty".into());
+            }
+        }
+        if self.boundary.len() + 1 != stages {
+            return Err("pipeline stages require one boundary between each pair".into());
+        }
+        let mut boundaries: Vec<Option<&PipelineBoundary>> = vec![None; stages - 1];
+        let mut buffers = std::collections::HashSet::new();
+        for boundary in &self.boundary {
+            if boundary.producer as usize >= stages - 1
+                || boundary.consumer != boundary.producer + 1
+            {
+                return Err("pipeline boundaries must connect adjacent stages".into());
+            }
+            if boundary.buffer.is_empty()
+                || !matches!(boundary.dtype.as_str(), "bf16" | "f16" | "f32")
+            {
+                return Err("pipeline boundaries require a supported buffer and dtype".into());
+            }
+            if boundary.rows == 0
+                || boundary.elements == 0
+                || boundary.slots != self.activation_slots as u64
+            {
+                return Err("pipeline boundary geometry differs from its activation ring".into());
+            }
+            if !buffers.insert(&boundary.buffer) {
+                return Err("pipeline boundary buffer names must be unique".into());
+            }
+            let index = boundary.producer as usize;
+            if boundaries[index].replace(boundary).is_some() {
+                return Err(
+                    "pipeline stages require exactly one boundary between each pair".into(),
+                );
+            }
+            if !self.stage[index]
+                .outputs
+                .iter()
+                .any(|name| name == &boundary.buffer)
+                || !self.stage[index + 1]
+                    .inputs
+                    .iter()
+                    .any(|name| name == &boundary.buffer)
+            {
+                return Err("pipeline boundary buffers must be declared by both stages".into());
+            }
+        }
+        if boundaries.iter().any(Option::is_none) {
+            return Err("pipeline stages require one boundary between each pair".into());
+        }
+        for (index, stage) in self.stage.iter().enumerate() {
+            let expected_inputs = if index == 0 { 0 } else { 1 };
+            let expected_outputs = if index + 1 == stages { 0 } else { 1 };
+            if stage.inputs.len() != expected_inputs || stage.outputs.len() != expected_outputs {
+                return Err(
+                    "pipeline stages must declare exactly their adjacent boundaries".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PreparedContract {
     pub fn graph(&self, name: &str) -> Result<&GraphContract> {
         self.graphs
@@ -337,9 +545,74 @@ impl PreparedContract {
             .ok_or_else(|| format!("graph {name} has no semantic contract").into())
     }
 
+    /// Select one stage's graph and cache declarations as an ordinary contract.
+    pub fn stage_view(&self, stage: usize) -> Result<PreparedContract> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or("pipeline stage view requires a pipeline contract")?;
+        let selected = pipeline
+            .stage
+            .get(stage)
+            .ok_or_else(|| format!("pipeline stage {stage} is outside the package"))?;
+        let mut frontend = self.frontend.clone();
+        if !selected.has_vision {
+            frontend.image_preparation = None;
+            frontend.image_layout = None;
+            frontend.image_tokens = None;
+        }
+        Ok(PreparedContract {
+            version: 2,
+            vocabulary: self.vocabulary,
+            input_vocabulary: self.input_vocabulary,
+            vision: if selected.has_vision {
+                self.vision.clone()
+            } else {
+                VisionCapabilities::disabled()
+            },
+            cache: selected.cache.clone(),
+            graphs: selected.graphs.clone(),
+            frontend,
+            pipeline: None,
+        })
+    }
+
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
+        if let Some(pipeline) = &self.pipeline {
+            if self.version != 3 {
+                return Err("pipeline packages require prepared model contract version 3".into());
+            }
+            pipeline.validate()?;
+            if !self.graphs.is_empty()
+                || self.cache.page_tokens != 0
+                || !self.cache.regions.is_empty()
+                || !self.cache.page_tables.is_empty()
+            {
+                return Err(
+                    "pipeline contracts keep graph and cache declarations in their stages".into(),
+                );
+            }
+            if self.vocabulary == 0
+                || self.input_vocabulary < self.vocabulary
+                || self.input_vocabulary > u32::MAX as usize
+                || !matches!(self.frontend.position_dimensions, 0 | 3)
+            {
+                return Err("invalid prepared model contract vocabulary or geometry".into());
+            }
+            self.vision.validate()?;
+            self.frontend.validate()?;
+            if self.vision.enabled() != pipeline.stage[0].has_vision
+                || self.vision.enabled() != self.frontend.image_layout.is_some()
+                || self.frontend.image_layout.is_some() != self.frontend.image_preparation.is_some()
+            {
+                return Err("image processing and prepared vision capacities must agree".into());
+            }
+            return Ok(());
+        }
         if self.version != 2 {
-            return Err("unsupported prepared model contract version; re-export the model package".into());
+            return Err(
+                "unsupported prepared model contract version; re-export the model package".into(),
+            );
         }
         if self.vocabulary == 0
             || self.input_vocabulary < self.vocabulary
@@ -710,5 +983,153 @@ mod tests {
             let result = syntax.validate();
             assert_eq!(result.is_ok(), valid, "{tool:?} {open} {marker} {result:?}");
         }
+    }
+
+    fn pipeline_contract() -> PreparedContract {
+        let mut contract = crate::model::testing::metadata();
+        let graphs = std::mem::take(&mut contract.graphs);
+        let cache = contract.cache.clone();
+        contract.version = 3;
+        contract.cache = CacheContract {
+            page_tokens: 0,
+            regions: vec![],
+            page_tables: vec![],
+        };
+        contract.pipeline = Some(PipelineContract {
+            version: 1,
+            stages: 2,
+            activation_slots: 3,
+            embedding_stage: 0,
+            sampling_stage: 1,
+            mtp_stage: 1,
+            stage: vec![
+                PipelineStage {
+                    index: 0,
+                    first_layer: 0,
+                    last_layer: 24,
+                    pages: 64,
+                    state_rows: 8,
+                    snapshots: 4,
+                    graphs: graphs.clone(),
+                    cache: cache.clone(),
+                    inputs: vec![],
+                    outputs: vec!["activation".into()],
+                    has_vision: false,
+                    has_mtp: false,
+                    has_head: false,
+                },
+                PipelineStage {
+                    index: 1,
+                    first_layer: 24,
+                    last_layer: 48,
+                    pages: 64,
+                    state_rows: 8,
+                    snapshots: 4,
+                    graphs,
+                    cache,
+                    inputs: vec!["activation".into()],
+                    outputs: vec![],
+                    has_vision: false,
+                    has_mtp: false,
+                    has_head: true,
+                },
+            ],
+            boundary: vec![PipelineBoundary {
+                producer: 0,
+                consumer: 1,
+                buffer: "activation".into(),
+                dtype: "bf16".into(),
+                rows: 8,
+                elements: 16,
+                slots: 3,
+            }],
+        });
+        contract
+    }
+
+    #[test]
+    fn pipeline_stages_select_their_local_graphs_and_cache() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+        let contract = pipeline_contract();
+        contract.validate(&manifest).unwrap();
+        let stage = contract.stage_view(0).unwrap();
+        assert_eq!(stage.version, 2);
+        assert!(stage.pipeline.is_none());
+        assert!(!stage.graphs.is_empty());
+        stage.validate(&manifest).unwrap();
+        assert!(contract.stage_view(2).is_err());
+    }
+
+    #[test]
+    fn pipeline_layout_rejects_gaps_and_missing_boundaries() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+
+        let mut gap = pipeline_contract();
+        gap.pipeline.as_mut().unwrap().stage[1].first_layer = 25;
+        assert!(
+            gap.validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("contiguous")
+        );
+
+        let mut missing = pipeline_contract();
+        missing.pipeline.as_mut().unwrap().boundary.clear();
+        assert!(
+            missing
+                .validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("boundary")
+        );
+
+        let mut shared = pipeline_contract();
+        shared.graphs = config.contract.graphs.clone();
+        assert!(
+            shared
+                .validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("stages")
+        );
+    }
+
+    #[test]
+    fn pipeline_contract_round_trips_through_json() {
+        let contract = pipeline_contract();
+        let json = serde_json::to_vec(&contract).unwrap();
+        let decoded: PreparedContract = serde_json::from_slice(&json).unwrap();
+        let pipeline = decoded.pipeline.unwrap();
+        assert_eq!(pipeline.stages, 2);
+        assert_eq!(pipeline.stage[1].first_layer, 24);
+        assert_eq!(pipeline.boundary[0].buffer, "activation");
+    }
+
+    #[test]
+    fn pipeline_versions_require_matching_layout() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+
+        let mut version = pipeline_contract();
+        version.version = 2;
+        assert!(
+            version
+                .validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("version 3")
+        );
+
+        let mut missing = pipeline_contract();
+        missing.pipeline = None;
+        assert!(
+            missing
+                .validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
     }
 }

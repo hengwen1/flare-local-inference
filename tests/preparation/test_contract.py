@@ -12,6 +12,30 @@ from ignition.preparation import contract as c, runtime_package_pb2 as p
 from ignition.preparation.execution import GraphSignature
 
 
+def test_pipeline_contract_serializes_stage_layout_and_keeps_declarations_local():
+    stage = lambda index, first, last, **flags: c.pipeline_stage(
+        index, first, last, pages=64, state_rows=8, snapshots=4,
+        graphs=[dict(graph="decode", kind=p.DECODE)], cache=dict(page_tokens=64), **flags)
+    value = c.model_contract(vocabulary=248320, page_tokens=0, page_tables=[], graphs=[],
+        frontend={}, regions=[], pipeline=c.pipeline_contract(
+            stage=[stage(0, 0, 24, outputs=["activation"], has_vision=True),
+                   stage(1, 24, 48, inputs=["activation"], has_head=True)],
+            boundary=[c.pipeline_boundary(0, 1, "activation", rows=8, elements=10240, slots=3)],
+            activation_slots=3))
+    encoded = ParseDict(value, p.ModelContract())
+    assert encoded.version == 3
+    assert encoded.pipeline.stages == 2 and encoded.pipeline.activation_slots == 3
+    assert encoded.pipeline.stage[0].first_layer == 0
+    assert encoded.pipeline.stage[1].first_layer == 24
+    assert encoded.pipeline.boundary[0].buffer == "activation"
+    assert encoded.pipeline.boundary[0].dtype == "bf16"
+    assert not encoded.graphs and not encoded.cache.page_tokens
+
+    with pytest.raises(ValueError, match="stages"):
+        c.model_contract(vocabulary=248320, page_tokens=64, page_tables=[], graphs=[],
+            frontend={}, regions=[], pipeline=encoded.pipeline)
+
+
 @pytest.mark.parametrize("recipe,page,lag,rows", [
     ("qwen38", 64, 1, 1), ("glm53", 256, 1, 1),
     ("deepseek41", 128, 0, None), ("deepseek4", 128, 0, None), ("mimo_v2", 128, 0, 1),

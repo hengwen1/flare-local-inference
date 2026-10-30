@@ -67,6 +67,36 @@ impl RankExecutor {
         }
     }
 
+    /// Copies one prepared boundary buffer to pinned host storage. Pipeline
+    /// stages execute as local graphs; tensor-parallel and threaded executors
+    /// reject boundary reads rather than silently returning another rank's data.
+    pub(crate) fn read_buffer(
+        &mut self,
+        buffer: &str,
+        host: &crate::cuda::PinnedHost,
+    ) -> Result<()> {
+        match self {
+            Self::Local(executor) => executor.read_buffer(buffer, host),
+            Self::Parallel(_) | Self::Threaded(_) => {
+                Err("pipeline boundary reads require local stage execution".into())
+            }
+        }
+    }
+
+    /// Uploads pinned host storage into one prepared boundary buffer.
+    pub(crate) fn write_buffer(
+        &mut self,
+        buffer: &str,
+        host: &crate::cuda::PinnedHost,
+    ) -> Result<()> {
+        match self {
+            Self::Local(executor) => executor.write_buffer(buffer, host),
+            Self::Parallel(_) | Self::Threaded(_) => {
+                Err("pipeline boundary writes require local stage execution".into())
+            }
+        }
+    }
+
     #[cfg(feature = "server")]
     pub(crate) fn manifest(&self) -> &ExecutionManifest {
         match self {

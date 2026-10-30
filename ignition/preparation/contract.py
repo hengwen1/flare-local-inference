@@ -101,11 +101,43 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
         required_marker=required_marker)
 
 
+def pipeline_stage(index, first_layer, last_layer, *, pages, state_rows, snapshots, graphs, cache,
+                   inputs=(), outputs=(), has_vision=False, has_mtp=False, has_head=False):
+    """Describe one pipeline stage's decoder range, storage, and graph catalog."""
+    return dict(index=index, first_layer=first_layer, last_layer=last_layer, pages=pages,
+        state_rows=state_rows, snapshots=snapshots, graphs=list(graphs), cache=cache,
+        inputs=list(inputs), outputs=list(outputs), has_vision=has_vision,
+        has_mtp=has_mtp, has_head=has_head)
+
+
+def pipeline_boundary(producer, consumer, buffer, *, rows, elements, slots, dtype="bf16"):
+    """Describe one preallocated activation ring between adjacent stages."""
+    return dict(producer=producer, consumer=consumer, buffer=buffer, dtype=dtype,
+        rows=rows, elements=elements, slots=slots)
+
+
+def pipeline_contract(*, stage, boundary, activation_slots, embedding_stage=0,
+                      sampling_stage=None, mtp_stage=None, version=1):
+    """Assemble the package-level layout shared by every pipeline stage."""
+    stages = list(stage)
+    return dict(version=version, stages=len(stages), activation_slots=activation_slots,
+        embedding_stage=embedding_stage,
+        sampling_stage=len(stages) - 1 if sampling_stage is None else sampling_stage,
+        mtp_stage=len(stages) - 1 if mtp_stage is None else mtp_stage,
+        stage=stages, boundary=list(boundary))
+
+
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
-                   regions):
-    return dict(version=2, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
+                   regions, pipeline=None):
+    value = dict(version=2, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
         cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
+    if pipeline is not None:
+        if page_tokens or page_tables or graphs or regions:
+            raise ValueError("pipeline contracts keep graph and cache declarations in their stages")
+        value["version"] = 3
+        value["pipeline"] = pipeline
+    return value
 
 
 def vision_inputs(fields):

@@ -162,6 +162,46 @@ message ServingContract {
   // memory bandwidth the model consumes, which integrated GPUs do not measure.
   optional uint64 decode_weight_bytes = 25;
 }
+
+message PipelineContract {
+  uint32 version = 1;
+  uint32 stages = 2;
+  // Preallocated boundary buffers, and therefore in-flight pipeline jobs.
+  uint32 activation_slots = 3;
+  uint32 embedding_stage = 4;
+  uint32 sampling_stage = 5;
+  uint32 mtp_stage = 6;
+  repeated PipelineStage stage = 7;
+  repeated PipelineBoundary boundary = 8;
+}
+
+message PipelineStage {
+  uint32 index = 1;
+  // Decoder layer range, first inclusive and last exclusive.
+  uint32 first_layer = 2;
+  uint32 last_layer = 3;
+  uint64 pages = 4;
+  uint64 state_rows = 5;
+  uint64 snapshots = 6;
+  repeated GraphContract graphs = 7;
+  CacheContract cache = 8;
+  // Boundary buffer names this stage consumes and produces.
+  repeated string inputs = 9;
+  repeated string outputs = 10;
+  bool has_vision = 11;
+  bool has_mtp = 12;
+  bool has_head = 13;
+}
+
+message PipelineBoundary {
+  uint32 producer = 1;
+  uint32 consumer = 2;
+  string buffer = 3;
+  string dtype = 4;
+  uint64 rows = 5;
+  uint64 elements = 6;
+  uint64 slots = 7;
+}
 message ModelContract {
   uint32 version = 1;
   uint64 vocabulary = 2;
@@ -170,6 +210,10 @@ message ModelContract {
   CacheContract cache = 5;
   repeated GraphContract graphs = 6;
   FrontendContract frontend = 7;
+  // Present when the package's ranks are pipeline stages rather than tensor-parallel
+  // replicas. The stages share the model contract's vocabulary and frontend but own
+  // their graph catalogs and cache storage.
+  optional PipelineContract pipeline = 8;
 }
 message VisionCapacity {
   // Zero inherits prepared execution concurrency when max_images is nonzero.

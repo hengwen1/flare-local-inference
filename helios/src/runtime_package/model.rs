@@ -444,6 +444,11 @@ impl NativeModel {
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
+        if prepared.pipeline.is_some() {
+            return Err(invalid(
+                "pipeline-parallel packages require stage execution, which this build does not provide",
+            ));
+        }
         if prepared
             .graphs
             .iter()

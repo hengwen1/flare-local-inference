@@ -33,8 +33,22 @@ pub(super) fn serving_contract(
     value: wire::ServingContract,
     _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 2) {
-        return Err(invalid("unsupported prepared model contract version; re-export the model package"));
+    let contract = value
+        .model_contract
+        .as_ref()
+        .ok_or_else(|| invalid("model package lacks a prepared model contract"))?;
+    match (contract.version, contract.pipeline.is_some()) {
+        (2, false) | (3, true) => {}
+        (2, true) | (3, false) => {
+            return Err(invalid(
+                "prepared model contract version disagrees with its pipeline layout; re-export the model package",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "unsupported prepared model contract version; re-export the model package",
+            ));
+        }
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
     value.as_object_mut().unwrap().retain(|_, v| !v.is_null());
@@ -678,12 +692,125 @@ mod tests {
 
     #[test]
     fn prepared_contract_versions_require_reexport() {
-        for version in [0, 1, 3] {
+        for version in [0, 1, 4] {
             let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
                 version, ..Default::default()
             }), ..Default::default() };
             assert!(serving_contract(value, 4).unwrap_err().to_string().contains("re-export"));
         }
+    }
+
+    #[test]
+    fn prepared_contract_version_requires_matching_pipeline_layout() {
+        let missing = wire::ServingContract {
+            model_contract: Some(wire::ModelContract {
+                version: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            serving_contract(missing, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("pipeline")
+        );
+
+        let unexpected = wire::ServingContract {
+            model_contract: Some(wire::ModelContract {
+                version: 2,
+                pipeline: Some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            serving_contract(unexpected, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("pipeline")
+        );
+
+        let pipeline = wire::ServingContract {
+            model_contract: Some(wire::ModelContract {
+                version: 3,
+                pipeline: Some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(serving_contract(pipeline, 4).is_ok());
+    }
+
+    #[test]
+    fn pipeline_wire_contract_deserializes_into_the_native_contract() {
+        let mut native = crate::model::testing::metadata();
+        native.version = 3;
+        native.graphs.clear();
+        native.cache = crate::model::contract::CacheContract {
+            page_tokens: 0,
+            regions: vec![],
+            page_tables: vec![],
+        };
+        let mut wire: wire::ModelContract =
+            serde_json::from_value(serde_json::to_value(&native).unwrap()).unwrap();
+        wire.cache = Some(Default::default());
+        wire.vision = Some(Default::default());
+        wire.frontend = Some(Default::default());
+        wire.pipeline = Some(wire::PipelineContract {
+            version: 1,
+            stages: 2,
+            activation_slots: 3,
+            embedding_stage: 0,
+            sampling_stage: 1,
+            mtp_stage: 1,
+            stage: vec![
+                wire::PipelineStage {
+                    index: 0,
+                    first_layer: 0,
+                    last_layer: 24,
+                    pages: 64,
+                    state_rows: 8,
+                    snapshots: 4,
+                    outputs: vec!["activation".into()],
+                    cache: Some(wire::CacheContract {
+                        page_tokens: 64,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                wire::PipelineStage {
+                    index: 1,
+                    first_layer: 24,
+                    last_layer: 48,
+                    pages: 64,
+                    state_rows: 8,
+                    snapshots: 4,
+                    inputs: vec!["activation".into()],
+                    has_head: true,
+                    cache: Some(wire::CacheContract {
+                        page_tokens: 64,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            boundary: vec![wire::PipelineBoundary {
+                producer: 0,
+                consumer: 1,
+                buffer: "activation".into(),
+                dtype: "bf16".into(),
+                rows: 8,
+                elements: 10240,
+                slots: 3,
+            }],
+        });
+        let decoded: crate::model::PreparedContract =
+            serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
+        let pipeline = decoded.pipeline.unwrap();
+        assert_eq!(decoded.version, 3);
+        assert_eq!(pipeline.stage[1].first_layer, 24);
+        assert_eq!(pipeline.boundary[0].elements, 10240);
     }
 
     #[cfg(feature = "server")]

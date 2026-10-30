@@ -230,6 +230,7 @@ pub fn metadata() -> PreparedContract {
             prefix_boundary: None,
             image_tokens: None,
         },
+        pipeline: None,
     }
 }
 
