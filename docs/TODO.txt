@@ -146,3 +146,20 @@
     tests/server/test_nemotron.py::test_image_cache_identity: native serving of
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
+
+[ ] Implement pipeline-parallel preparation: stage partitioning, stage-local
+    bundles, and per-stage graph/boundary packing. The runtime currently
+    supports a prepared two-stage package but Ignition cannot export one.
+
+[ ] Validate two-stage pipeline text and vision serving on two Thors against
+    single-stage execution. No GPU pipeline execution has been run.
+
+[ ] Add a validate-then-commit command exchange for pipeline state fanout.
+    M1 runs the local stage before the remote stage and treats rejection as
+    fatal rather than rolling back.
+
+[ ] Replace serialized pipeline boundary publication with the activation_slots
+    ring and raise max_inflight above one. M1 admits one local frame at a time.
+
+[ ] Implement pipeline MTP proposal, target, and commit segments. M1 rejects
+    packages that declare MTP rather than serving stale draft state.
