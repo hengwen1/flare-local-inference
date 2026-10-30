@@ -287,7 +287,18 @@ impl BoundaryProducer {
 
     /// Reserves the consumer's next slot and publishes one activation payload.
     pub fn publish(&mut self, fence: u64, payload: &[u8]) -> io::Result<()> {
-        self.link.send_parts(FrameKind::Prepare, fence, &[])?;
+        self.publish_prepared(fence, &[], payload)
+    }
+
+    /// Publishes one activation with a stage control payload in its `PREPARE`
+    /// frame. The activation itself follows in `DATA`.
+    pub fn publish_prepared(
+        &mut self,
+        fence: u64,
+        prepare: &[u8],
+        payload: &[u8],
+    ) -> io::Result<()> {
+        self.link.send_parts(FrameKind::Prepare, fence, prepare)?;
         loop {
             let (kind, reply, length) = self.link.receive_header()?;
             self.link.receive_payload(&mut self.scratch, length)?;
@@ -609,6 +620,32 @@ mod tests {
         assert_eq!(prepare, b"stage request");
         assert_eq!(payload, b"activation");
         consumer.release(5).unwrap();
+        publishing.join().unwrap();
+    }
+
+    #[test]
+    fn producer_publishes_a_prepare_payload_before_the_activation() {
+        let (producer, consumer) = pair();
+        let mut producer = BoundaryProducer::new(producer);
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let publishing = std::thread::spawn(move || {
+            producer
+                .publish_prepared(7, b"stage request", b"activation")
+                .unwrap();
+            producer.wait_release(7).unwrap();
+        });
+
+        let mut prepare = Vec::new();
+        let mut payload = Vec::new();
+        assert!(matches!(
+            consumer
+                .receive_prepared_into(&mut prepare, &mut payload)
+                .unwrap(),
+            BoundaryEvent::Data(BoundaryData { fence: 7, .. })
+        ));
+        assert_eq!(prepare, b"stage request");
+        assert_eq!(payload, b"activation");
+        consumer.release(7).unwrap();
         publishing.join().unwrap();
     }
 

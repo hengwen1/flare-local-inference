@@ -228,6 +228,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Copies the uploads a remote stage declares into a control payload.
+///
+/// Stage zero packs every local input once; this filter keeps the uploads whose
+/// buffer names the next stage declares and drops stage-local-only inputs.
+pub fn stage_request(
+    graph: u32,
+    uploads: &[Upload<'_>],
+    remote_inputs: &[String],
+) -> Result<StageRequest> {
+    let mut selected = Vec::new();
+    for upload in uploads {
+        if !remote_inputs.iter().any(|name| name == upload.buffer) {
+            continue;
+        }
+        selected.push(StageUpload {
+            buffer: upload.buffer.to_owned(),
+            offset: u64::try_from(upload.offset).map_err(|_| {
+                protocol_error("pipeline upload offset exceeds the control payload")
+            })?,
+            nbytes: u64::try_from(upload.bytes.len())
+                .map_err(|_| protocol_error("pipeline upload byte count exceeds the control payload"))?,
+            data: upload.bytes.to_vec(),
+        });
+    }
+    Ok(StageRequest {
+        graph,
+        uploads: selected,
+    })
+}
+
 /// One completed frame reported by the final pipeline stage.
 pub struct StageCompletion {
     pub fence: u64,
@@ -371,6 +401,12 @@ pub unsafe fn serve_stage(
                     bytes: &buffer.bytes()[..nbytes],
                 });
                 for upload in &request.uploads {
+                    if upload.buffer == input_boundary.buffer {
+                        return Err(Error::execution(
+                            ExecutionError::State,
+                            "pipeline request uploads its boundary activation twice",
+                        ));
+                    }
                     let offset = usize::try_from(upload.offset).map_err(|_| {
                         Error::execution(
                             ExecutionError::State,
@@ -488,6 +524,33 @@ mod tests {
         let mut encoded = request().encode().unwrap();
         encoded[..4].copy_from_slice(&2u32.to_be_bytes());
         assert!(StageRequest::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn stage_requests_copy_only_remote_inputs() {
+        let uploads = [
+            Upload {
+                buffer: "positions",
+                offset: 16,
+                bytes: &[1, 2, 3, 4],
+            },
+            Upload {
+                buffer: "stage_zero_only",
+                offset: 0,
+                bytes: &[9],
+            },
+        ];
+        let request = stage_request(4, &uploads, &["positions".into()]).unwrap();
+        assert_eq!(request.graph, 4);
+        assert_eq!(
+            request.uploads,
+            vec![StageUpload {
+                buffer: "positions".into(),
+                offset: 16,
+                nbytes: 4,
+                data: vec![1, 2, 3, 4],
+            }]
+        );
     }
 
     #[test]
