@@ -617,6 +617,23 @@ mod tests {
         )
     }
 
+    fn completion(fence: u64) -> FrameCompletion {
+        FrameCompletion {
+            fence: crate::cache::Fence(fence),
+            graph_index: 1,
+            timing: crate::execution::ExecutionTiming::default(),
+            records: [crate::execution::CompletionRecord {
+                vector: Some(crate::execution::TokenVector::default()),
+                ..Default::default()
+            }]
+            .into(),
+            logprobs: None,
+            prompt_logprobs: None,
+            proposal_confidence: None,
+            speculative_survival: None,
+        }
+    }
+
     #[test]
     fn stage_requests_round_trip() {
         let value = request();
@@ -685,21 +702,7 @@ mod tests {
         let mut consumer = BoundaryConsumer::new(client, 1);
         let dispatch = StageDispatch::start(producer, 1).unwrap();
 
-        let completion = FrameCompletion {
-            fence: crate::cache::Fence(3),
-            graph_index: 1,
-            timing: crate::execution::ExecutionTiming::default(),
-            records: [crate::execution::CompletionRecord {
-                vector: Some(crate::execution::TokenVector::default()),
-                ..Default::default()
-            }]
-            .into(),
-            logprobs: None,
-            prompt_logprobs: None,
-            proposal_confidence: None,
-            speculative_survival: None,
-        };
-        let payload = crate::execution::stage_completion::encode(&completion).unwrap();
+        let payload = crate::execution::stage_completion::encode(&completion(3)).unwrap();
         let receiving = std::thread::spawn(move || {
             let mut prepare = Vec::new();
             let mut activation = Vec::new();
@@ -729,6 +732,50 @@ mod tests {
         assert_eq!(decoded.fence, crate::cache::Fence(3));
         assert_eq!(decoded.graph_index, 1);
         receiving.join().unwrap();
+    }
+
+    #[test]
+    fn stage_dispatch_returns_completions_in_job_order() {
+        use std::time::Duration;
+
+        let (producer, consumer) = pair();
+        let dispatch = StageDispatch::start(BoundaryProducer::new(producer), 2).unwrap();
+        let mut consumer = BoundaryConsumer::new(consumer, 2);
+        let committing = std::thread::spawn(move || {
+            for fence in [4, 5] {
+                let mut prepare = Vec::new();
+                let mut activation = Vec::new();
+                let BoundaryEvent::Data(data) = consumer
+                    .receive_prepared_into(&mut prepare, &mut activation)
+                    .unwrap()
+                else {
+                    panic!("expected activation data");
+                };
+                assert_eq!(data.fence, fence);
+                let payload =
+                    crate::execution::stage_completion::encode(&completion(fence)).unwrap();
+                consumer.commit_with(fence, &payload).unwrap();
+            }
+        });
+        for fence in [4, 5] {
+            dispatch
+                .submit(StageJob {
+                    fence,
+                    request: StageRequest::new(4, vec![]),
+                    activation: vec![7, 8],
+                })
+                .unwrap();
+        }
+        let mut fences = Vec::new();
+        while fences.len() < 2 {
+            if let Some(result) = dispatch.next_completion() {
+                fences.push(result.unwrap().fence.0);
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(fences, [4, 5]);
+        committing.join().unwrap();
     }
 
     #[test]
