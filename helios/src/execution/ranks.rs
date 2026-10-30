@@ -83,6 +83,24 @@ impl RankExecutor {
         }
     }
 
+    /// Copies a prepared boundary buffer range to pinned host storage.
+    pub(crate) fn read_buffer_range(
+        &mut self,
+        buffer: &str,
+        host: &crate::cuda::PinnedHost,
+        device_offset: usize,
+        nbytes: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Local(executor) => {
+                executor.read_buffer_range(buffer, host, device_offset, nbytes)
+            }
+            Self::Parallel(_) | Self::Threaded(_) => {
+                Err("pipeline boundary reads require local stage execution".into())
+            }
+        }
+    }
+
     /// Uploads pinned host storage into one prepared boundary buffer.
     pub(crate) fn write_buffer(
         &mut self,
@@ -93,6 +111,16 @@ impl RankExecutor {
             Self::Local(executor) => executor.write_buffer(buffer, host),
             Self::Parallel(_) | Self::Threaded(_) => {
                 Err("pipeline boundary writes require local stage execution".into())
+            }
+        }
+    }
+
+    /// Allocates pinned host storage for one boundary activation.
+    pub(crate) fn host_buffer(&mut self, nbytes: usize) -> Result<crate::cuda::PinnedHost> {
+        match self {
+            Self::Local(executor) => executor.host_buffer(nbytes),
+            Self::Parallel(_) | Self::Threaded(_) => {
+                Err("pipeline boundary buffers require local stage execution".into())
             }
         }
     }

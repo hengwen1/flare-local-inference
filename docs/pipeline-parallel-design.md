@@ -136,6 +136,12 @@ pipeline layout so the stage worker can validate stage roles and boundary
 geometry. Disk prefix-cache offload is rejected for pipeline packages; in-memory
 checkpoints remain in scope.
 
+A stage worker receives an activation into pinned storage, uploads it to the
+declared boundary buffer at the reserved slot, executes the requested stage
+graph, and publishes the next boundary activation. The final stage reports the
+frame completion instead of publishing. This loop performs no allocation after
+startup and keeps each stage's prepared buffers and context alive until drain.
+
 Stage zero remains the only scheduler and packer. It constructs per-stage input
 packing from each stage's graph contract and execution manifest, then sends
 buffer-name/offset/byte uploads. Remote stages do not run the scheduler.

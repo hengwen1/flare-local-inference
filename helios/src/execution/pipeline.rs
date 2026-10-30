@@ -5,8 +5,10 @@
 //! following `DATA` frame, so large tensors never pass through this encoding.
 
 use std::io;
+use std::sync::mpsc;
 
-use super::boundary::{BoundaryConsumer, BoundaryEvent};
+use super::boundary::{BoundaryConsumer, BoundaryEvent, BoundaryLink, BoundaryProducer};
+use super::{ExecutionManifest, FrameCompletion, RankExecutor, Upload};
 use crate::{Error, ExecutionError, Result};
 
 const VERSION: u32 = 1;
@@ -226,6 +228,206 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// One completed frame reported by the final pipeline stage.
+pub struct StageCompletion {
+    pub fence: u64,
+    pub completion: FrameCompletion,
+}
+
+fn boundary_error(error: impl std::fmt::Display) -> Error {
+    Error::execution(ExecutionError::State, format!("pipeline boundary: {error}"))
+}
+
+fn boundary_bytes(boundary: &crate::model::contract::PipelineBoundary) -> Result<usize> {
+    let element = match boundary.dtype.as_str() {
+        "bf16" | "f16" => 2,
+        "f32" => 4,
+        other => {
+            return Err(Error::execution(
+                ExecutionError::State,
+                format!("unsupported pipeline boundary dtype {other}"),
+            ));
+        }
+    };
+    boundary
+        .rows
+        .checked_mul(boundary.elements)
+        .and_then(|elements| elements.checked_mul(element))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            Error::execution(
+                ExecutionError::State,
+                "pipeline boundary geometry exceeds host address space",
+            )
+        })
+}
+
+/// Runs one non-first pipeline stage until the input boundary drains.
+///
+/// The stage uploads each activation into its declared boundary buffer, executes
+/// the requested graph, and forwards the next boundary activation. The final
+/// stage reports completions through `completions` instead of publishing.
+///
+/// # Safety
+/// The manifest's prepared graphs, buffers, and CUDA context must remain valid
+/// for the duration of the call. Stage execution is local; the manifest must not
+/// declare tensor-parallel peers.
+pub unsafe fn serve_stage(
+    manifest: ExecutionManifest,
+    input: BoundaryLink,
+    input_boundary: crate::model::contract::PipelineBoundary,
+    output: Option<(BoundaryLink, crate::model::contract::PipelineBoundary)>,
+    completions: mpsc::Sender<StageCompletion>,
+) -> Result<()> {
+    let input_bytes = boundary_bytes(&input_boundary)?;
+    let slots = usize::try_from(input_boundary.slots).map_err(|_| {
+        Error::execution(
+            ExecutionError::State,
+            "pipeline boundary slot count exceeds host address space",
+        )
+    })?;
+    if slots == 0 {
+        return Err(Error::execution(
+            ExecutionError::State,
+            "pipeline boundary requires at least one activation slot",
+        ));
+    }
+    let input_capacity = input_bytes.checked_mul(slots).ok_or_else(|| {
+        Error::execution(
+            ExecutionError::State,
+            "pipeline boundary buffer size exceeds host address space",
+        )
+    })?;
+    if manifest.buffer(&input_boundary.buffer)?.nbytes != input_capacity {
+        return Err(Error::execution(
+            ExecutionError::State,
+            "pipeline boundary geometry differs from the prepared input buffer",
+        ));
+    }
+    let output = output
+        .map(|(link, boundary)| {
+            boundary_bytes(&boundary).and_then(|bytes| {
+                let capacity = bytes.checked_mul(slots).ok_or_else(|| {
+                    Error::execution(
+                        ExecutionError::State,
+                        "pipeline boundary buffer size exceeds host address space",
+                    )
+                })?;
+                if manifest.buffer(&boundary.buffer)?.nbytes != capacity {
+                    return Err(Error::execution(
+                        ExecutionError::State,
+                        "pipeline boundary geometry differs from the prepared output buffer",
+                    ));
+                }
+                if boundary.slots != input_boundary.slots {
+                    return Err(Error::execution(
+                        ExecutionError::State,
+                        "adjacent pipeline boundaries disagree on activation slots",
+                    ));
+                }
+                Ok((link, boundary, bytes))
+            })
+        })
+        .transpose()?;
+
+    let mut worker = StageWorker::new(BoundaryConsumer::new(input, slots));
+    let mut executor = unsafe { RankExecutor::new(manifest, None) }?;
+    let staging_bytes = output
+        .as_ref()
+        .map_or(input_bytes, |(_, _, bytes)| input_bytes.max(*bytes));
+    let mut host = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        host.push(executor.host_buffer(staging_bytes)?);
+    }
+    let mut output =
+        output.map(|(link, boundary, bytes)| (BoundaryProducer::new(link), boundary, bytes));
+
+    loop {
+        match worker.receive().map_err(boundary_error)? {
+            StageEvent::Execute {
+                fence,
+                slot,
+                nbytes,
+                request,
+            } => {
+                if nbytes != input_bytes {
+                    return Err(Error::execution(
+                        ExecutionError::State,
+                        "pipeline activation size differs from the prepared boundary",
+                    ));
+                }
+                let Some(buffer) = host.get_mut(slot) else {
+                    return Err(Error::execution(
+                        ExecutionError::State,
+                        "pipeline activation slot exceeds the prepared boundary",
+                    ));
+                };
+                buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
+
+                let mut uploads = Vec::with_capacity(request.uploads.len() + 1);
+                uploads.push(Upload {
+                    buffer: input_boundary.buffer.as_str(),
+                    offset: slot * input_bytes,
+                    bytes: &buffer.bytes()[..nbytes],
+                });
+                for upload in &request.uploads {
+                    let offset = usize::try_from(upload.offset).map_err(|_| {
+                        Error::execution(
+                            ExecutionError::State,
+                            "pipeline upload offset exceeds host address space",
+                        )
+                    })?;
+                    uploads.push(Upload {
+                        buffer: upload.buffer.as_str(),
+                        offset,
+                        bytes: &upload.data,
+                    });
+                }
+                let graph = usize::try_from(request.graph).map_err(|_| {
+                    Error::execution(
+                        ExecutionError::State,
+                        "pipeline stage graph index exceeds host address space",
+                    )
+                })?;
+                if executor.submit(graph, &uploads, false)?.is_none() {
+                    return Err(Error::execution(
+                        ExecutionError::State,
+                        "pipeline stage executor reported backpressure after a completed frame",
+                    ));
+                }
+                let completion = loop {
+                    if let Some(completion) = executor.poll()? {
+                        break completion;
+                    }
+                    std::thread::yield_now();
+                };
+
+                if let Some((producer, boundary, bytes)) = output.as_mut() {
+                    let offset = slot.checked_mul(*bytes).ok_or_else(|| {
+                        Error::execution(
+                            ExecutionError::State,
+                            "pipeline boundary slot offset exceeds host address space",
+                        )
+                    })?;
+                    executor.read_buffer_range(&boundary.buffer, buffer, offset, *bytes)?;
+                    producer
+                        .publish(fence, &buffer.bytes()[..*bytes])
+                        .map_err(boundary_error)?;
+                    producer.wait_release(fence).map_err(boundary_error)?;
+                } else {
+                    completions
+                        .send(StageCompletion { fence, completion })
+                        .map_err(boundary_error)?;
+                }
+                worker.release(fence).map_err(boundary_error)?;
+            }
+            StageEvent::Cancel { .. } => {}
+            StageEvent::Drain => break,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +488,47 @@ mod tests {
         let mut encoded = request().encode().unwrap();
         encoded[..4].copy_from_slice(&2u32.to_be_bytes());
         assert!(StageRequest::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn boundary_geometry_matches_the_declared_dtype() {
+        let boundary = crate::model::contract::PipelineBoundary {
+            producer: 0,
+            consumer: 1,
+            buffer: "activation".into(),
+            dtype: "bf16".into(),
+            rows: 8,
+            elements: 16,
+            slots: 3,
+        };
+        assert_eq!(boundary_bytes(&boundary).unwrap(), 256);
+
+        let mut half = boundary.clone();
+        half.dtype = "f16".into();
+        assert_eq!(boundary_bytes(&half).unwrap(), 256);
+
+        let mut float = boundary;
+        float.dtype = "f32".into();
+        assert_eq!(boundary_bytes(&float).unwrap(), 512);
+    }
+
+    #[test]
+    fn boundary_geometry_rejects_unknown_dtypes_and_overflow() {
+        let mut boundary = crate::model::contract::PipelineBoundary {
+            producer: 0,
+            consumer: 1,
+            buffer: "activation".into(),
+            dtype: "fp8".into(),
+            rows: 1,
+            elements: 1,
+            slots: 1,
+        };
+        assert!(boundary_bytes(&boundary).is_err());
+
+        boundary.dtype = "f32".into();
+        boundary.rows = u64::MAX;
+        boundary.elements = 2;
+        assert!(boundary_bytes(&boundary).is_err());
     }
 
     #[test]

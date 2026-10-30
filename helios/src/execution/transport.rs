@@ -515,11 +515,33 @@ impl GraphExecutor {
         })
     }
 
+    /// Allocates pinned host storage for one boundary activation.
+    pub(crate) fn host_buffer(&mut self, nbytes: usize) -> Result<PinnedHost> {
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
+        resources.model.host_buffer(nbytes)
+    }
+
     /// Copies one prepared buffer into pinned host storage after every submitted
     /// frame has completed. Pipeline stages use this to publish a boundary
     /// activation; the caller must release or reuse the buffer only after the
     /// returned copy has finished.
     pub(crate) fn read_buffer(&mut self, name: &str, host: &PinnedHost) -> Result<()> {
+        let nbytes = self.manifest.buffer(name)?.nbytes;
+        self.read_buffer_range(name, host, 0, nbytes)
+    }
+
+    /// Copies a prepared buffer range into pinned host storage after every
+    /// submitted frame has completed.
+    pub(crate) fn read_buffer_range(
+        &mut self,
+        name: &str,
+        host: &PinnedHost,
+        device_offset: usize,
+        nbytes: usize,
+    ) -> Result<()> {
         if let Some(error) = &self.poison {
             return Err(ExecutionError::Poisoned(Failure::caused_by(
                 format!("executor failed: {error}"),
@@ -533,21 +555,34 @@ impl GraphExecutor {
                 "cannot read a boundary buffer while frames are outstanding",
             ));
         }
+        let buffer = self.manifest.buffer(name)?;
+        if device_offset
+            .checked_add(nbytes)
+            .is_none_or(|end| end > buffer.nbytes)
+        {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "boundary read exceeds the prepared device buffer",
+            ));
+        }
+        if host.bytes().len() < nbytes {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "boundary host buffer is smaller than the requested copy",
+            ));
+        }
         let resources = self
             .resources
             .as_mut()
             .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
-        let buffer = self.manifest.buffer(name)?;
-        if host.bytes().len() < buffer.nbytes {
-            return Err(Error::execution(
-                ExecutionError::Capacity,
-                "boundary host buffer is smaller than the prepared device buffer",
-            ));
-        }
         // SAFETY: The manifest retains the device range and the pinned host
         // buffer outlives the copy. No frame is outstanding, so the source is
         // stable until the synchronized copy returns.
-        unsafe { resources.copy.download(host, buffer.address, buffer.nbytes)? };
+        unsafe {
+            resources
+                .copy
+                .download(host, buffer.address + device_offset, nbytes)?
+        };
         resources.copy.synchronize()
     }
 
