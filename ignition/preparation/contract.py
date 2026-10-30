@@ -103,7 +103,11 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
 
 def pipeline_stage(index, first_layer, last_layer, *, pages, state_rows, snapshots, graphs, cache,
                    inputs=(), outputs=(), has_vision=False, has_mtp=False, has_head=False):
-    """Describe one pipeline stage's decoder range, storage, and graph catalog."""
+    """Describe one pipeline stage's decoder range, storage, and graph catalog.
+
+    ``inputs`` and ``outputs`` name only the adjacent boundary buffers; the
+    semantic uploads come from each graph's value bindings.
+    """
     return dict(index=index, first_layer=first_layer, last_layer=last_layer, pages=pages,
         state_rows=state_rows, snapshots=snapshots, graphs=list(graphs), cache=cache,
         inputs=list(inputs), outputs=list(outputs), has_vision=has_vision,

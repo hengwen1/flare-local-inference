@@ -186,6 +186,7 @@ message PipelineStage {
   repeated GraphContract graphs = 7;
   CacheContract cache = 8;
   // Boundary buffer names this stage consumes and produces.
+  // Adjacent boundary buffer names, not semantic uploads.
   repeated string inputs = 9;
   repeated string outputs = 10;
   bool has_vision = 11;
