@@ -118,7 +118,7 @@ impl StageRequest {
 pub enum StageEvent {
     Execute {
         fence: u64,
-        slot: usize,
+        slot: Option<usize>,
         nbytes: usize,
         request: StageRequest,
     },
@@ -155,8 +155,19 @@ impl StageWorker {
                 })?;
                 Ok(StageEvent::Execute {
                     fence: data.fence,
-                    slot: data.slot,
+                    slot: Some(data.slot),
                     nbytes: data.nbytes,
+                    request,
+                })
+            }
+            BoundaryEvent::Command { fence } => {
+                let request = StageRequest::decode(&self.prepare).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                Ok(StageEvent::Execute {
+                    fence,
+                    slot: None,
+                    nbytes: 0,
                     request,
                 })
             }
@@ -311,7 +322,7 @@ pub fn stage_request(
 pub struct StageJob {
     pub fence: u64,
     pub request: StageRequest,
-    pub activation: Vec<u8>,
+    pub activation: Option<Vec<u8>>,
 }
 
 /// Serial publisher for one stage-zero boundary.
@@ -340,9 +351,14 @@ impl StageDispatch {
                 while let Ok(job) = receiver.recv() {
                     let result = (|| {
                         let prepare = job.request.encode()?;
-                        producer
-                            .publish_prepared(job.fence, &prepare, &job.activation)
-                            .map_err(boundary_error)?;
+                        match &job.activation {
+                            Some(activation) => producer
+                                .publish_prepared(job.fence, &prepare, activation)
+                                .map_err(boundary_error)?,
+                            None => producer
+                                .publish_command(job.fence, &prepare)
+                                .map_err(boundary_error)?,
+                        }
                         let mut payload = Vec::new();
                         producer
                             .wait_commit(job.fence, &mut payload)
@@ -524,7 +540,7 @@ pub unsafe fn serve_stage(
                     nbytes,
                     request,
                 } => {
-                    if nbytes != input_bytes {
+                    if slot.is_some() && nbytes != input_bytes {
                         return Err(Error::execution(
                             ExecutionError::State,
                             "pipeline activation size differs from the prepared boundary",
@@ -559,14 +575,20 @@ pub unsafe fn serve_stage(
                         ));
                     }
 
-                    let Some(buffer) = host.get_mut(slot) else {
-                        return Err(Error::execution(
-                            ExecutionError::State,
-                            "pipeline activation slot exceeds the prepared boundary",
-                        ));
-                    };
                     let mut uploads = Vec::with_capacity(request.uploads.len() + 1);
                     if activation_bound {
+                        let Some(slot) = slot else {
+                            return Err(Error::execution(
+                                ExecutionError::State,
+                                "pipeline command cannot bind a boundary activation",
+                            ));
+                        };
+                        let Some(buffer) = host.get_mut(slot) else {
+                            return Err(Error::execution(
+                                ExecutionError::State,
+                                "pipeline activation slot exceeds the prepared boundary",
+                            ));
+                        };
                         buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
                         uploads.push(Upload {
                             buffer: input_boundary.buffer.as_str(),
@@ -607,6 +629,18 @@ pub unsafe fn serve_stage(
                     };
 
                     if let Some((producer, boundary, bytes)) = output.as_mut() {
+                        let Some(slot) = slot else {
+                            return Err(Error::execution(
+                                ExecutionError::State,
+                                "pipeline command cannot publish a boundary activation",
+                            ));
+                        };
+                        let Some(buffer) = host.get_mut(slot) else {
+                            return Err(Error::execution(
+                                ExecutionError::State,
+                                "pipeline boundary activation has no host buffer",
+                            ));
+                        };
                         let offset = slot.checked_mul(*bytes).ok_or_else(|| {
                             Error::execution(
                                 ExecutionError::State,
@@ -776,7 +810,7 @@ mod tests {
             .submit(StageJob {
                 fence: 3,
                 request: StageRequest::new(4, vec![]),
-                activation: vec![7, 8],
+                activation: Some(vec![7, 8]),
             })
             .unwrap();
         let decoded = loop {
@@ -788,6 +822,43 @@ mod tests {
         assert_eq!(decoded.fence, crate::cache::Fence(3));
         assert_eq!(decoded.graph_index, 1);
         receiving.join().unwrap();
+    }
+
+    #[test]
+    fn stage_dispatch_publishes_commands_without_activations() {
+        use std::time::Duration;
+
+        let (producer, consumer) = pair();
+        let dispatch = StageDispatch::start(BoundaryProducer::new(producer), 1).unwrap();
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let payload = crate::execution::stage_completion::encode(&completion(6)).unwrap();
+        let committing = std::thread::spawn(move || {
+            let mut prepare = Vec::new();
+            let mut activation = Vec::new();
+            assert_eq!(
+                consumer
+                    .receive_prepared_into(&mut prepare, &mut activation)
+                    .unwrap(),
+                BoundaryEvent::Command { fence: 6 }
+            );
+            assert!(activation.is_empty());
+            consumer.commit_with(6, &payload).unwrap();
+        });
+        dispatch
+            .submit(StageJob {
+                fence: 6,
+                request: StageRequest::new(4, vec![]),
+                activation: None,
+            })
+            .unwrap();
+        let decoded = loop {
+            if let Some(result) = dispatch.next_completion() {
+                break result.unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(decoded.fence, crate::cache::Fence(6));
+        committing.join().unwrap();
     }
 
     #[test]
@@ -818,7 +889,7 @@ mod tests {
                 .submit(StageJob {
                     fence,
                     request: StageRequest::new(4, vec![]),
-                    activation: vec![7, 8],
+                    activation: Some(vec![7, 8]),
                 })
                 .unwrap();
         }
@@ -929,6 +1000,37 @@ mod tests {
     }
 
     #[test]
+    fn stage_worker_decodes_commands_without_activations() {
+        use super::super::boundary::{BoundaryConsumer, BoundaryLink, FrameKind};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || BoundaryLink::connect(address).unwrap());
+        let server = BoundaryLink::accept(&listener).unwrap();
+        let mut producer = client.join().unwrap();
+        let mut worker = StageWorker::new(BoundaryConsumer::new(server, 1));
+        let control = request().encode().unwrap();
+        let publishing = std::thread::spawn(move || {
+            producer
+                .send_parts(FrameKind::Command, 12, &control)
+                .unwrap();
+        });
+        match worker.receive().unwrap() {
+            StageEvent::Execute {
+                fence,
+                slot,
+                nbytes,
+                request: decoded,
+            } => {
+                assert_eq!((fence, slot, nbytes), (12, None, 0));
+                assert_eq!(decoded, request());
+            }
+            event => panic!("unexpected stage event: {event:?}"),
+        }
+        publishing.join().unwrap();
+    }
+
+    #[test]
     fn boundary_geometry_matches_the_declared_dtype() {
         let boundary = crate::model::contract::PipelineBoundary {
             producer: 0,
@@ -1000,7 +1102,7 @@ mod tests {
                 nbytes,
                 request: decoded,
             } => {
-                assert_eq!((fence, slot, nbytes), (11, 0, 10));
+                assert_eq!((fence, slot, nbytes), (11, Some(0), 10));
                 assert_eq!(decoded, request());
             }
             event => panic!("unexpected stage event: {event:?}"),

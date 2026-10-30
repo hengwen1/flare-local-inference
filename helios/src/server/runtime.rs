@@ -947,7 +947,7 @@ struct StagePending {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StageActivation {
     Boundary,
-    Zero,
+    Command,
 }
 
 impl<'a> Worker<'a> {
@@ -1946,13 +1946,13 @@ impl<'a> Worker<'a> {
             .stage_host
             .as_mut()
             .ok_or("pipeline stage has no pinned boundary storage")?;
-        match pending.activation {
+        let activation = match pending.activation {
             StageActivation::Boundary => {
                 executor.read_buffer_range(buffer, host, 0, *bytes)?;
+                Some(host.bytes()[..*bytes].to_vec())
             }
-            StageActivation::Zero => host.bytes_mut()[..*bytes].fill(0),
-        }
-        let activation = host.bytes()[..*bytes].to_vec();
+            StageActivation::Command => None,
+        };
         self.dispatch
             .as_ref()
             .ok_or("pipeline stage has no boundary dispatcher")?
@@ -2127,7 +2127,7 @@ impl<'a> Worker<'a> {
                     activation: if pipeline_activation(step.kind) {
                         StageActivation::Boundary
                     } else {
-                        StageActivation::Zero
+                        StageActivation::Command
                     },
                     local_completion: !pipeline_activation(step.kind),
                 },

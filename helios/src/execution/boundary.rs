@@ -33,6 +33,8 @@ pub enum FrameKind {
     Drain,
     /// The sender failed; the payload is a UTF-8 description.
     Error,
+    /// Producer requests one stage operation without an activation payload.
+    Command,
 }
 
 impl FrameKind {
@@ -46,6 +48,7 @@ impl FrameKind {
             5 => Self::Cancel,
             6 => Self::Drain,
             7 => Self::Error,
+            8 => Self::Command,
             _ => return Err(invalid("unknown pipeline frame kind")),
         })
     }
@@ -277,6 +280,7 @@ pub struct BoundaryData {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryEvent {
     Data(BoundaryData),
+    Command { fence: u64 },
     Cancel { fence: u64 },
     Drain,
 }
@@ -368,6 +372,12 @@ impl BoundaryProducer {
         }
     }
 
+    /// Publishes one control-only stage request without reserving an activation
+    /// slot.
+    pub fn publish_command(&mut self, fence: u64, prepare: &[u8]) -> io::Result<()> {
+        self.link.send_parts(FrameKind::Command, fence, prepare)
+    }
+
     pub fn cancel(&mut self, fence: u64) -> io::Result<()> {
         self.link.send_parts(FrameKind::Cancel, fence, &[])
     }
@@ -439,6 +449,15 @@ impl BoundaryConsumer {
                         nbytes: length,
                     }));
                 }
+                FrameKind::Command => {
+                    self.link.receive_payload(prepare, length)?;
+                    if prepared.is_some() {
+                        return Err(invalid(
+                            "pipeline boundary received a command during preparation",
+                        ));
+                    }
+                    return Ok(BoundaryEvent::Command { fence });
+                }
                 FrameKind::Cancel => {
                     self.link.receive_payload(&mut self.scratch, length)?;
                     if prepared
@@ -490,7 +509,8 @@ impl BoundaryConsumer {
     }
 
     fn complete(&mut self, fence: u64, kind: FrameKind, payload: &[u8]) -> io::Result<()> {
-        if !self.slots.release(fence) {
+        let released = self.slots.release(fence);
+        if !released && kind != FrameKind::Commit {
             return Err(invalid("pipeline boundary released an unreserved slot"));
         }
         self.link.send_parts(kind, fence, payload)
@@ -544,6 +564,26 @@ mod tests {
         assert_eq!(consumer.receive().unwrap().payload, [1, 2, 3, 4]);
         assert_eq!(producer.receive().unwrap().kind, FrameKind::Ready);
         assert_eq!(producer.receive().unwrap().kind, FrameKind::Release);
+    }
+
+    #[test]
+    fn commands_carry_control_payloads_without_a_slot() {
+        let (producer, consumer) = pair();
+        let mut producer = BoundaryProducer::new(producer);
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let sending = std::thread::spawn(move || producer.publish_command(12, b"request").unwrap());
+        let mut prepare = Vec::new();
+        let mut payload = Vec::new();
+        assert_eq!(
+            consumer
+                .receive_prepared_into(&mut prepare, &mut payload)
+                .unwrap(),
+            BoundaryEvent::Command { fence: 12 }
+        );
+        assert_eq!(prepare, b"request");
+        assert!(payload.is_empty());
+        assert_eq!(consumer.slots.free(), 1);
+        sending.join().unwrap();
     }
 
     #[test]

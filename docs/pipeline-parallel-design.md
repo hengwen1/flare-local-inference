@@ -139,9 +139,9 @@ checkpoints remain in scope.
 A stage worker receives an activation into pinned storage, uploads it to the
 declared boundary buffer at the reserved slot when the requested graph binds
 that buffer, executes the requested stage graph, and publishes the next
-boundary activation. State operations do not read the boundary and skip the
-activation upload. The final stage commits an encoded frame completion upstream
-instead of publishing. The completion carries
+boundary activation. State operations arrive as `COMMAND` frames, reserve no
+slot, and skip the activation upload. The final stage commits an encoded frame
+completion upstream instead of publishing. The completion carries
 records, timing, logprobs, proposal confidence, and speculative survival, and
 stage zero validates its fence before publishing the request result. This loop
 performs no allocation after startup and keeps each stage's prepared buffers and
@@ -219,11 +219,11 @@ stage commits; a rejection suppresses the commit everywhere. Snapshot-slot
 reuse is acknowledged by every stage before reuse.
 
 In M1, stage zero runs `Init`, `Restore`, `Snapshot`, and `Resume` locally and
-then sends the same prepared request to the next stage with a zeroed activation.
+then sends the same prepared request to the next stage as a boundary `COMMAND`.
 The local completion is published only after the remote stage acknowledges. A
-remote rejection is fatal and does not roll back the local stage; a dedicated
-command frame with validate-then-commit ordering is required before claiming
-cross-stage atomicity.
+remote rejection is fatal and does not roll back the local stage; a
+validate-then-commit command exchange is required before claiming cross-stage
+atomicity.
 
 Prefix checkpoints remain in memory in this version. Pipeline packages reject
 disk offload configuration explicitly; per-stage offload shards are a later
