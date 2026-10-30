@@ -470,8 +470,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                         decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
                             completion, frame, sequence, session=session, name=name,
                             embedding_injection=injection, max_cache_pages=planned_pages,
-                            residual_input=pipeline_activation if config.pipeline_stage > 0 else None,
-                            residual_output=pipeline_activation if config.pipeline_stage + 1 < config.pipeline_stages else None,
+                            residual_input=(pipeline_activation[:s.residual.shape[0]]
+                                            if config.pipeline_stage > 0 else None),
+                            residual_output=(pipeline_activation[:s.residual.shape[0]]
+                                             if config.pipeline_stage + 1 < config.pipeline_stages else None),
                             first_layer=config.first_layer, last_layer=config.last_layer,
                             sampling_workspace=sampling_workspace,
                             scoring=scoring if kind == "scored_prefill" else None, **collectives)
