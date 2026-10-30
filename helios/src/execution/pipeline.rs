@@ -490,6 +490,19 @@ pub unsafe fn serve_stage(
         })
         .transpose()?;
 
+    let graphs = manifest
+        .graphs
+        .iter()
+        .map(|graph| {
+            (
+                graph.kind,
+                graph
+                    .input_bindings
+                    .iter()
+                    .any(|binding| binding.buffer_name == input_boundary.buffer),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut worker = StageWorker::new(BoundaryConsumer::new(input, slots));
     let mut executor = unsafe { RankExecutor::new(manifest, None) }?;
     let staging_bytes = output
@@ -517,20 +530,50 @@ pub unsafe fn serve_stage(
                             "pipeline activation size differs from the prepared boundary",
                         ));
                     }
+                    let graph_index = usize::try_from(request.graph).map_err(|_| {
+                        Error::execution(
+                            ExecutionError::State,
+                            "pipeline stage graph index exceeds host address space",
+                        )
+                    })?;
+                    let (kind, activation_bound) =
+                        graphs.get(graph_index).copied().ok_or_else(|| {
+                            Error::execution(
+                                ExecutionError::State,
+                                "pipeline stage graph index exceeds the prepared catalog",
+                            )
+                        })?;
+                    if !activation_bound
+                        && matches!(
+                            kind,
+                            super::GraphKind::Prefill
+                                | super::GraphKind::ScoredPrefill
+                                | super::GraphKind::Decode
+                                | super::GraphKind::Speculative
+                                | super::GraphKind::Mixed
+                        )
+                    {
+                        return Err(Error::execution(
+                            ExecutionError::State,
+                            "pipeline stage graph does not read the boundary activation",
+                        ));
+                    }
+
                     let Some(buffer) = host.get_mut(slot) else {
                         return Err(Error::execution(
                             ExecutionError::State,
                             "pipeline activation slot exceeds the prepared boundary",
                         ));
                     };
-                    buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
-
                     let mut uploads = Vec::with_capacity(request.uploads.len() + 1);
-                    uploads.push(Upload {
-                        buffer: input_boundary.buffer.as_str(),
-                        offset: slot * input_bytes,
-                        bytes: &buffer.bytes()[..nbytes],
-                    });
+                    if activation_bound {
+                        buffer.bytes_mut()[..nbytes].copy_from_slice(worker.payload());
+                        uploads.push(Upload {
+                            buffer: input_boundary.buffer.as_str(),
+                            offset: slot * input_bytes,
+                            bytes: &buffer.bytes()[..nbytes],
+                        });
+                    }
                     for upload in &request.uploads {
                         if upload.buffer == input_boundary.buffer {
                             return Err(Error::execution(
@@ -550,13 +593,7 @@ pub unsafe fn serve_stage(
                             bytes: &upload.data,
                         });
                     }
-                    let graph = usize::try_from(request.graph).map_err(|_| {
-                        Error::execution(
-                            ExecutionError::State,
-                            "pipeline stage graph index exceeds host address space",
-                        )
-                    })?;
-                    if executor.submit(graph, &uploads, false)?.is_none() {
+                    if executor.submit(graph_index, &uploads, false)?.is_none() {
                         return Err(Error::execution(
                             ExecutionError::State,
                             "pipeline stage executor reported backpressure after a completed frame",
