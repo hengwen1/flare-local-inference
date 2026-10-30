@@ -53,6 +53,15 @@ def _parser() -> argparse.ArgumentParser:
                                 " an export publishes all ranks to the shared model cache on rank zero")
         hosts.add_argument("--rendezvous", metavar="ADDR:PORT",
                            help="IPv4 address and port on which rank zero admits its peers")
+    for running in (serving, exporting):
+        pipeline = running.add_argument_group("pipeline parallelism")
+        pipeline.add_argument("--pipeline-stages", type=int, choices=(1, 2), default=1, metavar="N",
+                              help="pipeline stages, one rank per host (default: 1); stage zero serves HTTP")
+        pipeline.add_argument("--stage-layers", metavar="A,B",
+                              help="inclusive decoder layer boundaries, such as 0,24,48; required with"
+                                   " --pipeline-stages 2")
+        pipeline.add_argument("--pipeline-activation-slots", type=int, default=1, metavar="N",
+                              help="preallocated activation ring slots between adjacent stages (default: 1)")
     serving.add_argument("--prefix-cache-states", type=int, metavar="N",
                          help="advanced: cached request states kept resident for prefix reuse; fewer leave more"
                               " memory for KV pages (default: sized from free memory)")

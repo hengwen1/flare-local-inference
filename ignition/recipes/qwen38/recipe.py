@@ -40,6 +40,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk, mixed_prefill=plan.mixed_prefill,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
+        pipeline_stages=plan.pipeline_stages, stage_layers=plan.stage_layers,
+        pipeline_activation_slots=plan.pipeline_activation_slots,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
         storage = {} if package_storage is None else {"package_storage": package_storage}

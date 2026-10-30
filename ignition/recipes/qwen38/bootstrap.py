@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -30,6 +30,7 @@ from ignition.components.sampling import AdmissionBuffers
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
+from ignition.preparation import contract as contract_values
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
@@ -95,6 +96,14 @@ class PreparationConfig:
     # Run shared experts, small-batch attention projections and selection, and GDN input projections
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
+    # Pipeline preparation runs one decoder range per stage; stages are separate
+    # ranks and never combine with tensor parallelism.
+    pipeline_stage: int = 0
+    pipeline_stages: int = 1
+    stage_layers: tuple[int, ...] | None = None
+    first_layer: int = 0
+    last_layer: int = 48
+    pipeline_activation_slots: int = 1
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -125,10 +134,27 @@ class PreparationConfig:
             raise ValueError("explicit page capacity must be a positive integer")
         if type(self.mtp) is not bool or type(self.stream_overlap) is not bool:
             raise TypeError("MTP and stream overlap switches must be booleans")
+        if self.pipeline_stages not in (1, 2):
+            raise ValueError("pipeline preparation supports one or two stages")
+        if type(self.pipeline_stage) is not int or not 0 <= self.pipeline_stage < self.pipeline_stages:
+            raise ValueError("pipeline stage must index its declared stage count")
+        if self.pipeline_stages > 1:
+            if (self.stage_layers is None or len(self.stage_layers) != self.pipeline_stages + 1
+                    or self.stage_layers[0] != 0 or self.stage_layers[-1] != 48
+                    or any(first >= last for first, last in zip(self.stage_layers, self.stage_layers[1:]))):
+                raise ValueError("pipeline stage layers must increase from zero through 48")
+            if self.mtp:
+                raise ValueError("pipeline preparation does not support MTP")
+        if not 0 <= self.first_layer < self.last_layer <= 48:
+            raise ValueError("pipeline stage layer range must be a nonempty subset of 0 through 48")
+        if type(self.pipeline_activation_slots) is not int or self.pipeline_activation_slots < 1:
+            raise ValueError("pipeline activation slots must be positive")
+        if self.pipeline_stages > 1 and self.pipeline_activation_slots != 1:
+            raise ValueError("pipeline preparation currently supports one activation slot")
         if type(self.mixed_prefill) is not bool:
             raise TypeError("mixed_prefill must be a boolean")
         minimum_snapshot = HybridStateLayout.build(speculative_tokens=7 if self.mtp else 0,
-            world_size=1 if self.devices is None else len(self.devices)).row_bytes
+            world_size=1 if self.devices is None or self.pipeline_stages > 1 else len(self.devices)).row_bytes
         if self.snapshot_budget_bytes < minimum_snapshot or self.headroom_bytes < 0:
             raise ValueError("snapshot budget requires at least one state row; headroom must be nonnegative")
         widths = self.speculative_widths
@@ -190,6 +216,32 @@ class PreparationConfig:
 
 
 
+def _pipeline_model_contract(base, config, pages, state_rows, snapshots):
+    """Build the package-wide stage layout from one stage's prepared catalog.
+
+    Text graph contracts are identical across stages; only stage zero captures
+    vision. Layer ranges and adjacent boundary buffers distinguish the stages.
+    """
+    stages = []
+    for index in range(config.pipeline_stages):
+        first, last = config.stage_layers[index], config.stage_layers[index + 1]
+        graphs = base["graphs"] if index == 0 else [
+            graph for graph in base["graphs"] if graph["kind"] != contract_proto.VISION]
+        stages.append(contract_values.pipeline_stage(index, first, last,
+            pages=pages, state_rows=state_rows, snapshots=snapshots, graphs=graphs,
+            cache=base["cache"], inputs=[] if index == 0 else ["pipeline_activation"],
+            outputs=[] if index + 1 == config.pipeline_stages else ["pipeline_activation"],
+            has_vision=index == 0 and any(graph["kind"] == contract_proto.VISION for graph in base["graphs"]),
+            has_mtp=False, has_head=index + 1 == config.pipeline_stages))
+    boundary = [contract_values.pipeline_boundary(0, 1, "pipeline_activation",
+        rows=config.token_capacity, elements=10240, slots=config.pipeline_activation_slots)]
+    return contract_values.model_contract(vocabulary=base["vocabulary"],
+        input_vocabulary=base["input_vocabulary"], vision=base["vision"],
+        page_tokens=0, page_tables=[], graphs=[], frontend=base["frontend"], regions=[],
+        pipeline=contract_values.pipeline_contract(stage=stages, boundary=boundary,
+            activation_slots=config.pipeline_activation_slots))
+
+
 def _identity(manifest, world_size=1):
     sources = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                for path in sorted(Path(__file__).parent.glob("*.py"))}
@@ -244,7 +296,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             progress(message)
 
     config = PreparationConfig() if config is None else config
-    shard = TensorParallelShard(rank, 1 if config.devices is None else len(config.devices))
+    if config.pipeline_stages > 1:
+        config = replace(config, pipeline_stage=rank,
+                         first_layer=config.stage_layers[rank], last_layer=config.stage_layers[rank + 1])
+    shard = (TensorParallelShard(0, 1) if config.pipeline_stages > 1
+             else TensorParallelShard(rank, 1 if config.devices is None else len(config.devices)))
     if (shard.world_size > 1) != (group is not None):
         raise ValueError("tensor parallel preparation requires an established control group")
     device = torch.device("cuda", config.device if config.devices is None else config.devices[rank])
@@ -255,7 +311,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     # that memory to the device once tuning completes, before compiled forwards are bound.
     if package_storage is not None:
         transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, progress=progress, shard=shard)
+    weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
+                                first_layer=config.first_layer, last_layer=config.last_layer)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -272,7 +329,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     table = PLETable.load(manifest, device, tokens=config.token_capacity, progress=progress, **host_storage)
     sample_rows = max(batch * width for batch, width in config.speculative_shapes) if config.mtp else config.request_capacity
     sample_rows += bool(config.mixed_shapes)
-    coordinator = CollectivePreparation(group) if group is not None else None
+    coordinator = CollectivePreparation(group) if group is not None and config.pipeline_stages == 1 else None
     ipc = None if package_storage is None else package_storage.peer_storage
     collective = vocabulary_collective = None
     if coordinator is not None and coordinator.spans_hosts:
@@ -340,6 +397,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 **{name: getattr(vision_inputs, name) for name in vision_inputs.__dataclass_fields__},
                 "frame_index": frame, "submission_sequence": sequence, **completion.buffers(),
                 "sampling_grammar_mask": requests.grammar_mask, "state_pool": state.backing, "memory_capacity": state.memory_capacity}
+            pipeline_activation = None
+            if config.pipeline_stages > 1:
+                pipeline_activation = torch.zeros((config.token_capacity, 10240), dtype=torch.bfloat16, device=device)
+                buffers["pipeline_activation"] = pipeline_activation
             functions, signatures, decoders, owners = {}, {}, [], []
             speculation = None
             if config.mtp:
@@ -370,21 +431,22 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                                   prefill_capacity=prefill_capacity)
                 stage.update(advance=1)
 
-            vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
-            for capacity in (16384, 4096, 1024, 256):
-                cursor = graph_buffers.cursor()
-                s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device, buffers=cursor)
-                handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion, frame, sequence,
-                                               pixels=s.patches, buffers=cursor)
-                handoff.prepare()
-                with torch.device("meta"):
-                    module = Qwen4ExpVisionModel(weights.tree.config.vision_config)
-                module.eval().requires_grad_(False)
-                encoder = PreparedVision(module, s, handoff.metadata, weights.vision, session=session,
-                    name=f"vision{capacity}", projection_workspace=workspaces,
-                    attention_workspace=workspaces)
-                add(f"vision{capacity}", PreparedVisionGeneration(handoff, encoder), "vision", 1, capacity, vision_fields)
-                owners.extend((handoff, encoder))
+            if config.pipeline_stage == 0:
+                vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
+                for capacity in (16384, 4096, 1024, 256):
+                    cursor = graph_buffers.cursor()
+                    s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device, buffers=cursor)
+                    handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion, frame, sequence,
+                                                   pixels=s.patches, buffers=cursor)
+                    handoff.prepare()
+                    with torch.device("meta"):
+                        module = Qwen4ExpVisionModel(weights.tree.config.vision_config)
+                    module.eval().requires_grad_(False)
+                    encoder = PreparedVision(module, s, handoff.metadata, weights.vision, session=session,
+                        name=f"vision{capacity}", projection_workspace=workspaces,
+                        attention_workspace=workspaces)
+                    add(f"vision{capacity}", PreparedVisionGeneration(handoff, encoder), "vision", 1, capacity, vision_fields)
+                    owners.extend((handoff, encoder))
 
             for enabled in serving_modes:
                 suffix = "-no-mtp" if config.mtp and not enabled else ""
@@ -408,6 +470,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                         decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
                             completion, frame, sequence, session=session, name=name,
                             embedding_injection=injection, max_cache_pages=planned_pages,
+                            residual_input=pipeline_activation if config.pipeline_stage > 0 else None,
+                            residual_output=pipeline_activation if config.pipeline_stage + 1 < config.pipeline_stages else None,
+                            first_layer=config.first_layer, last_layer=config.last_layer,
                             sampling_workspace=sampling_workspace,
                             scoring=scoring if kind == "scored_prefill" else None, **collectives)
                         forward = speculation.prefill(decoder, name) if enabled else decoder
@@ -501,8 +566,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
 
         def rebind_cache(pages):
             for decoder in decoders:
-                for index in range(3, 48, 4):
-                    decoder.layers[index][1].rebind_pages_for_preparation(pages[index])
+                for local_index, index in enumerate(decoder.layer_indices):
+                    if index % 4 == 3:
+                        decoder.layers[local_index][1].rebind_pages_for_preparation(pages[index])
                 decoder.qsa_states = pages
             if speculation is not None:
                 speculation.rebind_pages_for_preparation(pages)
@@ -566,12 +632,15 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             for layer, value in (final_cache or cache).items()
             for name in ("main_k_cache", "main_v_cache", "compressed_k_cache")]
         buffers["request_pending_token"] = requests.pending_token
+        model_contract = prepare_contract(signatures, buffers, state, image_slots=config.image_concurrency, page_tokens=64, draft_lag=1 if has_mtp else None, embedding_tables=(0,), regions=cache_regions)
+        if config.pipeline_stages > 1:
+            model_contract = _pipeline_model_contract(model_contract, config, page_capacity, state_rows, snapshots)
         server_config = {"model_id": MODEL_ID, "identity": _identity(manifest, shard.world_size),
             "max_sequence_tokens": config.context, "prefill_chunk_size": config.prefill_chunk_size,
             "pages": page_capacity, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": 64,
             "frontend": prepare_frontend(manifest.snapshot, eos_token_ids=[248046, 248044], image_profile="qwen"),
             "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
-            "model_contract": prepare_contract(signatures, buffers, state, image_slots=config.image_concurrency, page_tokens=64, draft_lag=1 if has_mtp else None, embedding_tables=(0,), regions=cache_regions),
+            "model_contract": model_contract,
             "assets": {name: {"path": str((manifest.snapshot / filename).resolve()), "sha256": digest}
                        for name, (filename, digest) in hashes.items()}}
         server_config["assets"]["chat_template"] = annotated_template_asset(

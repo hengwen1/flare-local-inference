@@ -108,6 +108,21 @@ layers remain meta and are never captured. MTP and vision preparation on SM110
 are part of this work; missing SM110 components are added in Ignition rather
 than replaced by a fallback.
 
+The current implementation prepares an explicit two-stage text package. Each
+host prepares its own stage with one GPU:
+
+```sh
+ignition export MODEL --ranks 2 --pipeline-stages 2 --stage-layers 0,24,48 \
+    --rendezvous HOST0:29700
+```
+
+Stage zero captures vision graphs; the last stage captures the final mixer,
+head, and sampler. The activation boundary is one preallocated BF16 buffer with
+one slot; MTP, mixed prefill, RoCE rings, and multiple activation slots are
+rejected until their preparation paths exist. Export publishes the package-wide
+contract from stage zero, while each rank contributes its own graph catalog and
+buffer manifest.
+
 ## Runtime
 
 Stage zero runs the existing server, scheduler, and worker with a pipeline

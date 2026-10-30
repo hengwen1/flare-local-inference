@@ -29,6 +29,25 @@ def _checkpoint_fabric(args):
                 streams=8 if args.transfer_streams is None else args.transfer_streams)
 
 
+def _stage_layers(args):
+    if args.pipeline_stages == 1:
+        return None
+    if args.stage_layers is None:
+        raise UsageError("--pipeline-stages 2 requires --stage-layers A,B")
+    try:
+        values = tuple(int(value) for value in args.stage_layers.split(","))
+    except ValueError as error:
+        raise UsageError("--stage-layers must be comma-separated decoder layer boundaries") from error
+    return values
+
+
+def _check_pipeline_args(args) -> None:
+    if args.pipeline_stages > 1 and args.ranks != args.pipeline_stages:
+        raise UsageError("--pipeline-stages requires one rank per stage through --ranks")
+    if args.pipeline_stages > 1 and args.pipeline_activation_slots < 1:
+        raise UsageError("--pipeline-activation-slots must be positive")
+
+
 def _address(host: str, port: int) -> str:
     """Validate a listening address and confirm that nothing else holds it."""
     try:
@@ -150,6 +169,7 @@ def _export_hosts(args):
     from ignition.preparation.host_ranks import HostRendezvous, local_topology, source_identity, topology_gpu
 
     _check_host_shape(args)
+    _check_pipeline_args(args)
     if args.rendezvous is None:
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
@@ -181,7 +201,9 @@ def _export_hosts(args):
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                         mla_compute_mode=args.mla_compute_mode)
+                         mla_compute_mode=args.mla_compute_mode,
+                         pipeline_stages=args.pipeline_stages, stage_layers=_stage_layers(args),
+                         pipeline_activation_slots=args.pipeline_activation_slots)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    native_dense_activations=args.native_dense_activations)
@@ -256,7 +278,9 @@ def _prepare(args):
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                      mla_compute_mode=args.mla_compute_mode)
+                      mla_compute_mode=args.mla_compute_mode,
+                      pipeline_stages=args.pipeline_stages, stage_layers=_stage_layers(args),
+                      pipeline_activation_slots=args.pipeline_activation_slots)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
@@ -397,6 +421,10 @@ def serve(args) -> int:
         raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
                                                 args.max_concurrency)
+    _check_pipeline_args(args)
+    if args.pipeline_stages > 1:
+        raise UsageError("pipeline serving runs an exported package through `flare run`; "
+                         "`ignition serve` prepares and serves one stage")
     host = Host.discover()
     bind = _address(configuration.get("server.host", args.host).value,
                     configuration.get("server.port", args.port).value)
@@ -429,7 +457,9 @@ def serve(args) -> int:
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
-                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
+                         pipeline_stages=args.pipeline_stages, stage_layers=_stage_layers(args),
+                         pipeline_activation_slots=args.pipeline_activation_slots)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    native_dense_activations=args.native_dense_activations)

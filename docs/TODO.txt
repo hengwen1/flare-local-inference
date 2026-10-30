@@ -147,9 +147,10 @@
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
 
-[ ] Implement pipeline-parallel preparation: stage partitioning, stage-local
-    bundles, and per-stage graph/boundary packing. The runtime currently
-    supports a prepared two-stage package but Ignition cannot export one.
+[ ] Finish pipeline-parallel preparation: automatic stage partitioning and
+    per-stage memory reports. Explicit two-stage text packages export through
+    `ignition export --pipeline-stages 2 --stage-layers 0,24,48`; stage-local
+    bundles and boundary packing are implemented.
 
 [ ] Validate two-stage pipeline text and vision serving on two Thors against
     single-stage execution. No GPU pipeline execution has been run.

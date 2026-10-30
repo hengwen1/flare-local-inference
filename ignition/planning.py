@@ -190,6 +190,10 @@ class Plan:
     online_mxfp8: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+    # Pipeline stages each own a decoder range; stages are ranks, never TP shards.
+    pipeline_stages: int = 1
+    stage_layers: tuple[int, ...] | None = None
+    pipeline_activation_slots: int = 1
 
     @property
     def world_size(self) -> int:
@@ -300,6 +304,9 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
+            "pipeline_stages": self.pipeline_stages,
+            "stage_layers": None if self.stage_layers is None else list(self.stage_layers),
+            "pipeline_activation_slots": self.pipeline_activation_slots,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 "packed_verification": self.speculation.packed_verification,
@@ -330,7 +337,9 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
-        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        language_model_only: bool = False, mla_compute_mode: str | None = None,
+        pipeline_stages: int = 1, stage_layers: tuple[int, ...] | None = None,
+        pipeline_activation_slots: int = 1) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -366,10 +375,11 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                                       speculation.token_capacity, speculation.graph_budget)
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
-    costs = recipe.costs(len(gpus), speculation, checkpoint)
+    shards = 1 if pipeline_stages > 1 else len(gpus)
+    costs = recipe.costs(shards, speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(checkpoint, shards, speculation, expert_scale_compression), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
@@ -377,7 +387,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
-                language_model_only=language_model_only)
+                language_model_only=language_model_only, pipeline_stages=pipeline_stages,
+                stage_layers=stage_layers, pipeline_activation_slots=pipeline_activation_slots)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
     if cache_states is not None:
@@ -431,7 +442,9 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+         language_model_only: bool = False, mla_compute_mode: str | None = None,
+         pipeline_stages: int = 1, stage_layers: tuple[int, ...] | None = None,
+         pipeline_activation_slots: int = 1) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -441,6 +454,42 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     across the ranks of recipes that declare context-parallel page costs. Without
     `stream_overlap`, recipes that declare stream overlap run every branch serially.
     """
+    if pipeline_stages not in (1, 2):
+        raise UsageError("--pipeline-stages supports one or two stages")
+    if pipeline_stages > 1:
+        if len(gpus) != pipeline_stages:
+            raise UsageError("--pipeline-stages requires one selected GPU per stage")
+        if stage_layers is None or len(stage_layers) != pipeline_stages + 1:
+            raise UsageError("--stage-layers must name every stage boundary, including zero and the decoder layer count")
+        if stage_layers[0] != 0 or stage_layers[-1] != 48 or any(
+                not isinstance(first, int) or not isinstance(last, int) or first >= last
+                for first, last in zip(stage_layers, stage_layers[1:])):
+            raise UsageError("--stage-layers must be increasing decoder boundaries from 0 through 48")
+        if speculation is not None:
+            raise UsageError("pipeline preparation does not support MTP")
+        if mixed_prefill:
+            raise UsageError("pipeline preparation does not support mixed prefill")
+        if context_parallel:
+            raise UsageError("pipeline preparation does not support context parallelism")
+        if roce_ring or roce_chain:
+            raise UsageError("pipeline stages do not form a RoCE ring or chain")
+        if pipeline_activation_slots < 1:
+            raise UsageError("--pipeline-activation-slots must be positive")
+        if pipeline_activation_slots != 1:
+            raise UsageError("--pipeline-activation-slots currently supports one slot")
+        candidate = fit(recipe, checkpoint, gpus, concurrency=concurrency, reserve_bytes=reserve_bytes,
+            speculation=speculation, prefill_chunk=prefill_chunk, context_parallel=context_parallel,
+            stream_overlap=stream_overlap, cache_states=cache_states, mixed_prefill=mixed_prefill,
+            prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
+            roce_ring=roce_ring, roce_chain=roce_chain,
+            image_concurrency=image_concurrency, online_mxfp8=online_mxfp8,
+            language_model_only=language_model_only, mla_compute_mode=mla_compute_mode,
+            pipeline_stages=pipeline_stages, stage_layers=stage_layers,
+            pipeline_activation_slots=pipeline_activation_slots)
+        if not candidate.fits:
+            raise _shortfall(candidate, ["--pipeline-stages 1", "fewer concurrent requests"],
+                             f"pipeline stages {pipeline_stages}")
+        return candidate
     if mixed_prefill and not recipe.mixed_prefill:
         raise UsageError(f"--mixed-prefill: {checkpoint.alias} does not capture mixed prefill/decode graphs")
     if online_mxfp8 and not recipe.online_mxfp8:
@@ -485,7 +534,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
-                   mla_compute_mode=mla_compute_mode)
+                   mla_compute_mode=mla_compute_mode, pipeline_stages=pipeline_stages,
+                   stage_layers=stage_layers, pipeline_activation_slots=pipeline_activation_slots)
 
     def automatic(world_size, **settings):
         """Plan the first GPUs that each fit, else the GPUs with the most free memory."""

@@ -90,6 +90,10 @@ impl LoadOptions {
                 "resident embedding scales require disk table storage; RAM storage already retains all planes",
             ));
         }
+        let pipeline = config
+            .get("model_contract")
+            .and_then(|contract| contract.get("pipeline"))
+            .is_some();
         let execution = packages
             .first()
             .and_then(|p| p.execution.as_ref())
@@ -275,7 +279,7 @@ impl LoadOptions {
                 (g.name.clone(), g.kind.clone(), g.sampling_mode.clone(), g.batch_capacity,
                     g.token_capacity, g.prefill_capacity, g.packed_token_capacity, g.draft_tokens,
                     g.verify_tokens, g.draft_source, g.confidence_width)).collect();
-            if rank_catalog.as_ref().is_some_and(|expected| *expected != catalog) {
+            if !pipeline && rank_catalog.as_ref().is_some_and(|expected| *expected != catalog) {
                 return Err(invalid("selected graph catalogs differ between ranks"));
             }
             rank_catalog = Some(catalog);
@@ -1312,6 +1316,23 @@ mod tests {
                     && (graph.kind != "speculative" || graph.token_capacity == 1 || graph.packed_token_capacity <= 9)));
             }
         }
+    }
+
+    #[test]
+    fn pipeline_stages_may_declare_different_graph_catalogs() {
+        let mut ranks = [package(), package()];
+        ranks[1]
+            .execution
+            .as_mut()
+            .unwrap()
+            .graphs
+            .retain(|graph| !(graph.kind == "speculative" && graph.token_capacity == 6));
+        refresh_graph_resources(&mut ranks[1]);
+        let mut configuration = config();
+        configuration["model_contract"] = serde_json::json!({"pipeline": {"stages": 2}});
+        LoadOptions::default()
+            .select(&mut ranks, &mut configuration)
+            .unwrap();
     }
 
     #[test]

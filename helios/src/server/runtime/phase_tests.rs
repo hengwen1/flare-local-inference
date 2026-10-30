@@ -128,6 +128,8 @@ impl Fixture {
             scheduler,
             receiver,
             4,
+            None,
+            None,
         );
         worker.inputs = Some(
             crate::model::Inputs::new(&self.config, &crate::model::testing::manifest(&self.config))
@@ -976,6 +978,8 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         scheduler,
         receiver,
         4,
+        None,
+        None,
     );
     worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -2933,6 +2937,8 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         scheduler,
         receiver,
         4,
+        None,
+        None,
     );
     worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
     worker.image_preparation = Some(ImagePreparation::new(None));

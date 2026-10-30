@@ -285,3 +285,19 @@ def test_native_dense_activations_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).native_dense_activations
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--native-dense-activations"]).native_dense_activations
+
+
+def test_pipeline_flags_parse_stage_boundaries():
+    from ignition.cli.serve import _check_pipeline_args, _stage_layers
+
+    args = _parser().parse_args(["export", "qwen3.8-flash", "--pipeline-stages", "2",
+                                 "--stage-layers", "0,24,48", "--ranks", "2",
+                                 "--rendezvous", "10.0.0.1:29600"])
+    assert args.pipeline_stages == 2
+    assert _stage_layers(args) == (0, 24, 48)
+    _check_pipeline_args(args)
+    missing = _parser().parse_args(["export", "qwen3.8-flash", "--pipeline-stages", "2"])
+    with pytest.raises(UsageError, match="--stage-layers"):
+        _stage_layers(missing)
+    with pytest.raises(UsageError, match="one rank per stage"):
+        _check_pipeline_args(missing)
