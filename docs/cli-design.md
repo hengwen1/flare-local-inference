@@ -132,7 +132,12 @@ loads the package locally and uses the rendezvous TCP stream for capacity
 agreement and the stage boundary; package distribution, RoCE, and agents are
 not used. Both ranks select GPU 0. This is a correctness and integration mode,
 not a performance path: the stages share one GPU and do not add compute or
-memory.
+memory. For example:
+
+```sh
+flare run PACKAGE --local-pipeline --rank 0 --rendezvous 127.0.0.1:29800
+flare run PACKAGE --local-pipeline --rank 1 --rendezvous 127.0.0.1:29800
+```
 
 `flare run PACKAGE --hosts PEER1,PEER2,...` runs rank zero locally and starts
 explicitly ordered peer agents. `--hosts` excludes rank zero. Pair the peers
