@@ -1,6 +1,7 @@
 //! Fixed-capacity graph execution over two pinned transport frames.
 
 pub mod boundary;
+pub mod stage_completion;
 mod manifest;
 mod parallel;
 pub mod pipeline;
@@ -21,7 +22,8 @@ mod worker;
 pub use parallel::{TensorParallelExecutor, serve_rank};
 pub(crate) use ranks::RankExecutor;
 pub use transport::{
-    CompletionRecord, ExecutionTiming, FrameCompletion, GraphExecutor, PromptLogprobs, TokenLogprobs,
+    CompletionRecord, ExecutionTiming, FrameCompletion, GraphExecutor, PromptLogprobs,
+    TokenLogprobs,
     TokenVector, Upload,
 };
 pub use worker::{ExecutionWorker, OwnedUpload};

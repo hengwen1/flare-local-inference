@@ -138,9 +138,12 @@ checkpoints remain in scope.
 
 A stage worker receives an activation into pinned storage, uploads it to the
 declared boundary buffer at the reserved slot, executes the requested stage
-graph, and publishes the next boundary activation. The final stage reports the
-frame completion instead of publishing. This loop performs no allocation after
-startup and keeps each stage's prepared buffers and context alive until drain.
+graph, and publishes the next boundary activation. The final stage commits an
+encoded frame completion upstream instead of publishing. The completion carries
+records, timing, logprobs, proposal confidence, and speculative survival, and
+stage zero validates its fence before publishing the request result. This loop
+performs no allocation after startup and keeps each stage's prepared buffers and
+context alive until drain.
 
 Stage zero remains the only scheduler and packer. It constructs per-stage input
 packing from each stage's graph contract and execution manifest, then sends

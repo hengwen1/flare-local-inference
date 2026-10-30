@@ -15,6 +15,25 @@ impl Default for ReadinessIntervals {
 }
 
 impl ReadinessIntervals {
+    pub(crate) fn from_pairs(pairs: &[[u64; 2]]) -> Result<Self> {
+        if pairs.len() > MAX_READINESS_INTERVALS {
+            return Err(invalid("readiness interval count exceeds capacity"));
+        }
+        if pairs.iter().any(|pair| pair[0] < pair[1]) {
+            return Err(invalid("readiness intervals must not be negative"));
+        }
+        let mut result = Self {
+            len: pairs.len(),
+            ..Self::default()
+        };
+        result.intervals[..pairs.len()].copy_from_slice(pairs);
+        Ok(result)
+    }
+
+    pub(crate) fn pairs(&self) -> &[[u64; 2]] {
+        &self.intervals[..self.len]
+    }
+
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() || bytes.len() % 24 != 0 || bytes.len() / 24 > MAX_READINESS_INTERVALS {
             return Err(invalid("invalid readiness timestamp extent"));

@@ -5,10 +5,8 @@
 //! following `DATA` frame, so large tensors never pass through this encoding.
 
 use std::io;
-use std::sync::mpsc;
-
 use super::boundary::{BoundaryConsumer, BoundaryEvent, BoundaryLink, BoundaryProducer};
-use super::{ExecutionManifest, FrameCompletion, RankExecutor, Upload};
+use super::{ExecutionManifest, RankExecutor, Upload};
 use crate::{Error, ExecutionError, Result};
 
 const VERSION: u32 = 1;
@@ -177,6 +175,10 @@ impl StageWorker {
     pub fn commit(&mut self, fence: u64) -> io::Result<()> {
         self.input.commit(fence)
     }
+
+    pub fn commit_with(&mut self, fence: u64, payload: &[u8]) -> io::Result<()> {
+        self.input.commit_with(fence, payload)
+    }
 }
 
 fn validate_upload(upload: &StageUpload) -> Result<()> {
@@ -258,12 +260,6 @@ pub fn stage_request(
     })
 }
 
-/// One completed frame reported by the final pipeline stage.
-pub struct StageCompletion {
-    pub fence: u64,
-    pub completion: FrameCompletion,
-}
-
 fn boundary_error(error: impl std::fmt::Display) -> Error {
     Error::execution(ExecutionError::State, format!("pipeline boundary: {error}"))
 }
@@ -296,7 +292,7 @@ fn boundary_bytes(boundary: &crate::model::contract::PipelineBoundary) -> Result
 ///
 /// The stage uploads each activation into its declared boundary buffer, executes
 /// the requested graph, and forwards the next boundary activation. The final
-/// stage reports completions through `completions` instead of publishing.
+/// stage commits the encoded frame completion upstream instead of publishing.
 ///
 /// # Safety
 /// The manifest's prepared graphs, buffers, and CUDA context must remain valid
@@ -307,7 +303,6 @@ pub unsafe fn serve_stage(
     input: BoundaryLink,
     input_boundary: crate::model::contract::PipelineBoundary,
     output: Option<(BoundaryLink, crate::model::contract::PipelineBoundary)>,
-    completions: mpsc::Sender<StageCompletion>,
 ) -> Result<()> {
     let input_bytes = boundary_bytes(&input_boundary)?;
     let slots = usize::try_from(input_boundary.slots).map_err(|_| {
@@ -450,12 +445,13 @@ pub unsafe fn serve_stage(
                         .publish(fence, &buffer.bytes()[..*bytes])
                         .map_err(boundary_error)?;
                     producer.wait_release(fence).map_err(boundary_error)?;
+                    worker.release(fence).map_err(boundary_error)?;
                 } else {
-                    completions
-                        .send(StageCompletion { fence, completion })
+                    let payload = super::stage_completion::encode(&completion)?;
+                    worker
+                        .commit_with(fence, &payload)
                         .map_err(boundary_error)?;
                 }
-                worker.release(fence).map_err(boundary_error)?;
             }
             StageEvent::Cancel { .. } => {}
             StageEvent::Drain => break,

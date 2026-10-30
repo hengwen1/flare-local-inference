@@ -336,6 +336,25 @@ impl BoundaryProducer {
         }
     }
 
+    /// Waits for the final stage's committed completion payload.
+    pub fn wait_commit(&mut self, fence: u64, payload: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            let (kind, reply, length) = self.link.receive_header()?;
+            self.link.receive_payload(payload, length)?;
+            match kind {
+                FrameKind::Commit if reply == fence => return Ok(()),
+                FrameKind::Cancel if reply == fence => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "pipeline boundary was cancelled",
+                    ));
+                }
+                FrameKind::Error => return Err(remote_error(payload)),
+                _ => return Err(unexpected("producer", kind, reply)),
+            }
+        }
+    }
+
     pub fn cancel(&mut self, fence: u64) -> io::Result<()> {
         self.link.send_parts(FrameKind::Cancel, fence, &[])
     }
@@ -438,19 +457,24 @@ impl BoundaryConsumer {
 
     /// Releases a consumed slot and acknowledges it to the producer.
     pub fn release(&mut self, fence: u64) -> io::Result<()> {
-        self.complete(fence, FrameKind::Release)
+        self.complete(fence, FrameKind::Release, &[])
     }
 
     /// Releases a committed slot and reports the request's final result upstream.
     pub fn commit(&mut self, fence: u64) -> io::Result<()> {
-        self.complete(fence, FrameKind::Commit)
+        self.commit_with(fence, &[])
     }
 
-    fn complete(&mut self, fence: u64, kind: FrameKind) -> io::Result<()> {
+    /// Releases a committed slot and sends the final-stage completion payload.
+    pub fn commit_with(&mut self, fence: u64, payload: &[u8]) -> io::Result<()> {
+        self.complete(fence, FrameKind::Commit, payload)
+    }
+
+    fn complete(&mut self, fence: u64, kind: FrameKind, payload: &[u8]) -> io::Result<()> {
         if !self.slots.release(fence) {
             return Err(invalid("pipeline boundary released an unreserved slot"));
         }
-        self.link.send_parts(kind, fence, &[])
+        self.link.send_parts(kind, fence, payload)
     }
 }
 
@@ -647,6 +671,32 @@ mod tests {
         assert_eq!(payload, b"activation");
         consumer.release(7).unwrap();
         publishing.join().unwrap();
+    }
+
+    #[test]
+    fn final_stage_commits_a_completion_payload() {
+        let (producer, consumer) = pair();
+        let mut producer = BoundaryProducer::new(producer);
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let publishing = std::thread::spawn(move || {
+            producer
+                .publish_prepared(9, b"request", b"activation")
+                .unwrap();
+            let mut payload = Vec::new();
+            producer.wait_commit(9, &mut payload).unwrap();
+            payload
+        });
+
+        let mut prepare = Vec::new();
+        let mut activation = Vec::new();
+        assert!(matches!(
+            consumer
+                .receive_prepared_into(&mut prepare, &mut activation)
+                .unwrap(),
+            BoundaryEvent::Data(BoundaryData { fence: 9, .. })
+        ));
+        consumer.commit_with(9, b"completion").unwrap();
+        assert_eq!(publishing.join().unwrap(), b"completion");
     }
 
     #[test]
