@@ -257,6 +257,25 @@ pub fn select_stage_graph(
         })
 }
 
+/// Returns the semantic uploads one prepared remote graph declares, excluding
+/// the boundary activation that travels separately in `DATA`.
+pub fn remote_upload_inputs(
+    stage: &crate::model::contract::PipelineStage,
+    graph: u32,
+    boundary: &str,
+) -> Result<Vec<String>> {
+    let contract = stage
+        .graphs
+        .get(graph as usize)
+        .ok_or_else(|| protocol_error("pipeline stage graph index is out of range"))?;
+    Ok(contract
+        .inputs
+        .iter()
+        .map(|binding| binding.buffer.clone())
+        .filter(|name| name != boundary)
+        .collect())
+}
+
 /// Copies the uploads a remote stage declares into a control payload.
 ///
 /// Stage zero packs every local input once; this filter keeps the uploads whose
@@ -791,7 +810,24 @@ mod tests {
                 crate::model::contract::GraphContract {
                     graph: "prefill".into(),
                     kind: crate::model::contract::GraphOperation::Prefill,
-                    inputs: vec![],
+                    inputs: vec![
+                        crate::model::contract::ValueBinding {
+                            buffer: "activation".into(),
+                            source: crate::model::contract::ValueSource::Constant,
+                            indexing: crate::model::contract::InputIndexing::Scalar,
+                            value_offset: 0,
+                            padding: 0,
+                            tensor: String::new(),
+                        },
+                        crate::model::contract::ValueBinding {
+                            buffer: "token_ids".into(),
+                            source: crate::model::contract::ValueSource::PromptToken,
+                            indexing: crate::model::contract::InputIndexing::PackedToken,
+                            value_offset: 0,
+                            padding: 0,
+                            tensor: String::new(),
+                        },
+                    ],
                     state: vec![],
                     state_rows_per_request: 0,
                     draft_cursor: None,
@@ -822,6 +858,10 @@ mod tests {
         };
         assert_eq!(select_stage_graph(&stage, "decode").unwrap(), 1);
         assert!(select_stage_graph(&stage, "vision").is_err());
+        assert_eq!(
+            remote_upload_inputs(&stage, 0, "activation").unwrap(),
+            ["token_ids"]
+        );
     }
 
     #[test]

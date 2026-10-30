@@ -2094,14 +2094,14 @@ impl<'a> Worker<'a> {
                     .boundary
                     .get(stage)
                     .ok_or("pipeline stage has no outgoing boundary")?;
-                let inputs = remote
-                    .inputs
-                    .iter()
-                    .filter(|name| **name != boundary.buffer)
-                    .cloned()
-                    .collect::<Vec<_>>();
                 let remote_graph =
                     select_stage_graph(remote, &executor.manifest().graphs[graph].name)?;
+                let inputs =
+                    crate::execution::pipeline::remote_upload_inputs(
+                        remote,
+                        remote_graph,
+                        &boundary.buffer,
+                    )?;
                 Some(stage_request(remote_graph, &uploads, &inputs)?)
             }
             _ => None,

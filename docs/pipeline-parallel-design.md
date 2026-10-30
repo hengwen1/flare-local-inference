@@ -147,11 +147,13 @@ context alive until drain.
 
 Stage zero remains the only scheduler and packer. It constructs per-stage input
 packing from each stage's graph contract and execution manifest, then sends
-buffer-name/offset/byte uploads. Remote stages do not run the scheduler. A
-dedicated boundary thread publishes completed local frames and returns committed
-completions to the worker. The first implementation serializes jobs on one
-boundary and admits one local frame at a time; `activation_slots` prepares the
-ring capacity, while overlapping boundary batches remain a later change.
+buffer-name/offset/byte uploads. The upload set comes from the selected remote
+graph's prepared value bindings, excluding the boundary activation that travels
+in `DATA`. Remote stages do not run the scheduler. A dedicated boundary thread
+publishes completed local frames and returns committed completions to the
+worker. The first implementation serializes jobs on one boundary and admits one
+local frame at a time; `activation_slots` prepares the ring capacity, while
+overlapping boundary batches remain a later change.
 
 ## MTP
 
