@@ -349,13 +349,26 @@ impl ModelRuntime {
         let (dispatch, stage_boundary) = match (config.pipeline.as_ref(), pipeline) {
             (Some(layout), Some(link)) => {
                 let stage = config.pipeline_stage as usize;
-                if stage + 1 >= layout.stages as usize {
-                    return Err("pipeline server must not be the final stage".into());
+                if stage != 0 {
+                    return Err("pipeline server must run the first stage".into());
                 }
                 let boundary = layout.boundary.get(stage).ok_or_else(|| {
                     "pipeline stage has no outgoing boundary".to_string()
                 })?;
                 let bytes = boundary_bytes(boundary)?;
+                let buffer = manifest
+                    .buffers
+                    .iter()
+                    .find(|buffer| buffer.name == boundary.buffer)
+                    .ok_or_else(|| "pipeline boundary buffer is not prepared".to_string())?;
+                let expected = bytes
+                    .checked_mul(layout.activation_slots as usize)
+                    .ok_or_else(|| "pipeline boundary size exceeds host address space".to_string())?;
+                if buffer.nbytes != expected {
+                    return Err(
+                        "pipeline boundary buffer size differs from its activation ring".into(),
+                    );
+                }
                 (
                     Some(StageDispatch::start(
                         crate::execution::boundary::BoundaryProducer::new(link),
