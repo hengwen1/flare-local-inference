@@ -353,12 +353,23 @@ impl BoundaryConsumer {
     /// Waits for one prepared activation and receives its payload directly into
     /// `payload`. The returned slot remains reserved until `release` or `commit`.
     pub fn receive_into(&mut self, payload: &mut Vec<u8>) -> io::Result<BoundaryEvent> {
+        self.receive_prepared_into(&mut Vec::new(), payload)
+    }
+
+    /// Receives one activation and its `PREPARE` control payload. The control
+    /// payload is copied into `prepare`; the activation payload is received
+    /// directly into `payload`.
+    pub fn receive_prepared_into(
+        &mut self,
+        prepare: &mut Vec<u8>,
+        payload: &mut Vec<u8>,
+    ) -> io::Result<BoundaryEvent> {
         let mut prepared = None;
         loop {
             let (kind, fence, length) = self.link.receive_header()?;
             match kind {
                 FrameKind::Prepare => {
-                    self.link.receive_payload(&mut self.scratch, length)?;
+                    self.link.receive_payload(prepare, length)?;
                     if prepared.is_some() {
                         return Err(invalid("pipeline boundary prepared two fences at once"));
                     }
@@ -567,6 +578,38 @@ mod tests {
         );
         assert_eq!(consumer.slots.free(), 1);
         cancelling.join().unwrap();
+    }
+
+    #[test]
+    fn prepare_payload_is_delivered_with_the_activation() {
+        let (producer, consumer) = pair();
+        let mut producer = BoundaryProducer::new(producer);
+        let mut consumer = BoundaryConsumer::new(consumer, 1);
+        let publishing = std::thread::spawn(move || {
+            producer
+                .link
+                .send_parts(FrameKind::Prepare, 5, b"stage request")
+                .unwrap();
+            let (kind, fence) = producer.link.receive_into(&mut Vec::new()).unwrap();
+            assert_eq!((kind, fence), (FrameKind::Ready, 5));
+            producer
+                .link
+                .send_parts(FrameKind::Data, 5, b"activation")
+                .unwrap();
+        });
+
+        let mut prepare = Vec::new();
+        let mut payload = Vec::new();
+        assert!(matches!(
+            consumer
+                .receive_prepared_into(&mut prepare, &mut payload)
+                .unwrap(),
+            BoundaryEvent::Data(BoundaryData { fence: 5, .. })
+        ));
+        assert_eq!(prepare, b"stage request");
+        assert_eq!(payload, b"activation");
+        consumer.release(5).unwrap();
+        publishing.join().unwrap();
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod boundary;
 mod manifest;
 mod parallel;
+pub mod pipeline;
 mod rank_stream;
 mod ranks;
 mod readiness;

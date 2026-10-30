@@ -127,7 +127,14 @@ The first boundary implementation is a framed full-duplex TCP link with
 frames. A producer publishes only after the consumer acknowledges a reserved
 slot, and the consumer receives activation bytes directly into caller-owned
 pinned storage. `SlotRing` tracks `activation_slots` reservations independently
-of completion ordering.
+of completion ordering. A `PREPARE` payload carries the stage graph index and
+small uploads; the activation itself follows in `DATA`.
+
+Package loading selects the bundle for this host's cluster rank and exposes its
+stage view as the prepared model contract. `NativeModel` retains the global
+pipeline layout so the stage worker can validate stage roles and boundary
+geometry. Disk prefix-cache offload is rejected for pipeline packages; in-memory
+checkpoints remain in scope.
 
 Stage zero remains the only scheduler and packer. It constructs per-stage input
 packing from each stage's graph contract and execution manifest, then sends

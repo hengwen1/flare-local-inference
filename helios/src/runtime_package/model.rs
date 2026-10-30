@@ -20,6 +20,7 @@ pub struct NativeModel {
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
     offload: Option<std::sync::Arc<crate::offload::Shared>>,
     cluster: Option<ClusterRank>,
+    pipeline: Option<crate::model::contract::PipelineContract>,
     roce: Vec<Option<RoceSpec>>,
 }
 
@@ -444,11 +445,31 @@ impl NativeModel {
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
-        if prepared.pipeline.is_some() {
-            return Err(invalid(
-                "pipeline-parallel packages require stage execution, which this build does not provide",
-            ));
-        }
+        let pipeline = prepared.pipeline.clone();
+        let prepared = if let Some(pipeline) = &pipeline {
+            pipeline.validate()?;
+            let cluster = cluster.as_ref().ok_or_else(|| {
+                invalid("pipeline packages require a multi-host cluster with one stage per host")
+            })?;
+            if cluster.world != pipeline.stages as usize || cluster.rank >= pipeline.stages as usize {
+                return Err(invalid(
+                    "pipeline stage count differs from the package's cluster world",
+                ));
+            }
+            if options.prefix_cache.disk.is_some()
+                && options.prefix_cache.disk_limit != Some(0)
+            {
+                return Err(invalid(
+                    "pipeline packages do not support disk prefix-cache offload; disable it for this model",
+                ));
+            }
+            let stage = prepared.stage_view(cluster.rank)?;
+            server_config["model_contract"] = serde_json::to_value(&stage)
+                .map_err(|error| invalid(format!("invalid stage contract: {error}")))?;
+            stage
+        } else {
+            prepared
+        };
         if prepared
             .graphs
             .iter()
@@ -588,6 +609,7 @@ impl NativeModel {
             engram: Vec::new(),
             offload: None,
             cluster,
+            pipeline,
             roce,
         };
         unsafe {
@@ -936,6 +958,11 @@ impl NativeModel {
         self.cluster.as_ref()
     }
 
+    /// The package's pipeline layout, or None for tensor-parallel and single-stage models.
+    pub fn pipeline(&self) -> Option<&crate::model::contract::PipelineContract> {
+        self.pipeline.as_ref()
+    }
+
     /// The host prefix store this process prepared, before the model worker opens it.
     pub fn offload(&self) -> Option<&crate::offload::Shared> {
         self.offload.as_deref()
@@ -1049,6 +1076,7 @@ mod tests {
             engram: Vec::new(),
             offload: None,
             cluster: None,
+            pipeline: None,
             roce: Vec::new(),
         };
         for prefix_cache in [

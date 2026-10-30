@@ -242,6 +242,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )?
     };
+    if owner.pipeline().is_some() {
+        return Err(
+            "pipeline-parallel packages require the stage worker, which this build does not provide"
+                .into(),
+        );
+    }
     let cluster = match (owner.cluster().cloned(), membership, rendezvous) {
         (Some(cluster), Some(membership), Some(address)) => Some((cluster, membership, address)),
         (None, None, None) => None,
