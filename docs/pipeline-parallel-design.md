@@ -181,7 +181,9 @@ commit are internal segments, not independently scheduled operations.
 
 Round `j`'s proposal depends on round `j-1`'s target hidden, so same-request
 rounds serialize at the last stage. Independent requests may interleave when
-their proposals are ready. The plan balances the last stage's head/MTP cost by
+their proposals are ready. M1 rejects pipeline packages that declare MTP rather
+than serving speculative rounds without their proposal segment; M2 adds the
+segmentation above. The plan balances the last stage's head/MTP cost by
 assigning it fewer layers when necessary. Measure proposal, target, commit, and
 last-stage idle time before claiming speculative throughput.
 

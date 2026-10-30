@@ -348,6 +348,11 @@ impl ModelRuntime {
         };
         let (dispatch, stage_boundary) = match (config.pipeline.as_ref(), pipeline) {
             (Some(layout), Some(link)) => {
+                if layout.stage.iter().any(|stage| stage.has_mtp) {
+                    return Err(
+                        "pipeline MTP is not implemented; re-export without MTP".into(),
+                    );
+                }
                 let stage = config.pipeline_stage as usize;
                 if stage != 0 {
                     return Err("pipeline server must run the first stage".into());
