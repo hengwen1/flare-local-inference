@@ -184,7 +184,8 @@ scratch. Multimodal prefix identity and snapshot semantics are unchanged.
 
 ## Scheduling
 
-The scheduler gains an in-flight window of `activation_slots`:
+The scheduler gains an in-flight window of `activation_slots`, carried as
+`PolicyConfig::max_inflight` and set from the package's pipeline contract:
 
 - Prefill chunks with fixed positions may fill the window.
 - Independent decode or speculative batches for different requests may fill it.

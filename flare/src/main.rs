@@ -559,7 +559,10 @@ fn serve(
         None => (!manifests.is_empty())
             .then_some(flare_helios::execution::RankPeers::Threads(manifests)),
     };
-    let bootstrap = Bootstrap::load(&config.to_string(), &manifest)?;
+    let mut bootstrap = Bootstrap::load(&config.to_string(), &manifest)?;
+    if let Some(pipeline) = owner.pipeline() {
+        bootstrap.server.scheduling_policy.max_inflight = pipeline.activation_slots as usize;
+    }
     phase.finish(format!(
         "{} token vocabulary",
         bootstrap.model.contract.vocabulary

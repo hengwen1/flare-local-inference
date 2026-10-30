@@ -439,6 +439,19 @@ fn indeterminate_and_equal_costs_naturally_choose_full_useful_speculation() {
 }
 
 #[test]
+fn scheduler_inflight_capacity_must_be_positive() {
+    let mut s = cold_engine(1, false);
+    assert_eq!(s.policy.max_inflight, 2);
+    assert!(
+        s.configure_policy(PolicyConfig {
+            max_inflight: 0,
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn indeterminate_execution_occupies_the_submission_window_until_completion() {
     let mut s = cold_engine(2, false);
     add(&mut s, 1, 1, 64);

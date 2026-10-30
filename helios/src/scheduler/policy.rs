@@ -16,6 +16,9 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    /// Maximum submissions whose execution may overlap. Pipeline packages set
+    /// this to their activation-slot count; other packages keep two.
+    pub max_inflight: usize,
 }
 
 impl Default for PolicyConfig {
@@ -30,6 +33,7 @@ impl Default for PolicyConfig {
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
+            max_inflight: 2,
         }
     }
 }
@@ -169,6 +173,9 @@ impl RequestScheduler {
         if !policy.adaptive_verification_alpha.is_finite() || policy.adaptive_verification_alpha <= 0.0 {
             return Err("adaptive verification alpha must be finite and greater than zero".into());
         }
+        if policy.max_inflight == 0 {
+            return Err("scheduler inflight capacity must be greater than zero".into());
+        }
         if !policy.output_token_value.is_finite()
             || policy.output_token_value <= 0.0
             || !policy.adaptation_ms.is_finite()
@@ -304,7 +311,7 @@ impl RequestScheduler {
     }
 
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
-        self.submissions.len() < 2
+        self.submissions.len() < self.policy.max_inflight
             && !self.submissions.values().any(|s| s.requires_feedback)
             && (self.submissions.is_empty() || duration_ns > 0)
             && self.window_remaining().is_some()
