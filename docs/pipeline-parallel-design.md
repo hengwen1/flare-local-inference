@@ -137,9 +137,11 @@ geometry. Disk prefix-cache offload is rejected for pipeline packages; in-memory
 checkpoints remain in scope.
 
 A stage worker receives an activation into pinned storage, uploads it to the
-declared boundary buffer at the reserved slot, executes the requested stage
-graph, and publishes the next boundary activation. The final stage commits an
-encoded frame completion upstream instead of publishing. The completion carries
+declared boundary buffer at the reserved slot when the requested graph binds
+that buffer, executes the requested stage graph, and publishes the next
+boundary activation. State operations do not read the boundary and skip the
+activation upload. The final stage commits an encoded frame completion upstream
+instead of publishing. The completion carries
 records, timing, logprobs, proposal confidence, and speculative survival, and
 stage zero validates its fence before publishing the request result. This loop
 performs no allocation after startup and keeps each stage's prepared buffers and
