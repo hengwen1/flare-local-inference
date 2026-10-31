@@ -933,15 +933,14 @@ struct Worker<'a> {
     dispatch: Option<StageDispatch>,
     stage_boundary: Option<(String, usize)>,
     stage_host: Option<crate::cuda::PinnedHost>,
+    stage_pending: Option<(crate::model::contract::StateView, crate::cuda::PinnedHost)>,
     stage_jobs: BTreeMap<crate::cache::Fence, StagePending>,
-    stage_locals: BTreeMap<crate::cache::Fence, crate::execution::FrameCompletion>,
     stage_kinds: BTreeMap<crate::cache::Fence, (GraphKind, usize)>,
 }
 
 struct StagePending {
     request: crate::execution::pipeline::StageRequest,
     activation: StageActivation,
-    local_completion: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -986,8 +985,8 @@ impl<'a> Worker<'a> {
             dispatch,
             stage_boundary,
             stage_host: None,
+            stage_pending: None,
             stage_jobs: BTreeMap::new(),
-            stage_locals: BTreeMap::new(),
             stage_kinds: BTreeMap::new(),
         }
     }
@@ -998,24 +997,35 @@ impl<'a> Worker<'a> {
         if let Some((_, bytes)) = &self.stage_boundary {
             self.stage_host = Some(executor.host_buffer(*bytes)?);
         }
+        if let Some(view) = self
+            .config
+            .pipeline
+            .as_ref()
+            .and_then(|layout| layout.stage.first())
+            .and_then(|stage| stage.graphs.iter().find_map(|graph| graph.pending_token.clone()))
+        {
+            let host = executor.host_buffer(view.nbytes)?;
+            self.stage_pending = Some((view, host));
+        }
         while !self.stop.load(Ordering::Acquire) {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
             };
-            if let Some(completion) = executor.poll()? {
+            let completion = if self.config.pipeline.is_some() {
+                executor.poll_local()?
+            } else {
+                executor.poll()?
+            };
+            if let Some(completion) = completion {
                 if let Some(pending) = self.stage_jobs.remove(&completion.fence) {
-                    let fence = completion.fence;
-                    if pending.local_completion {
-                        self.stage_locals.insert(fence, completion);
-                    }
-                    self.publish_stage(executor, fence, pending)?;
+                    self.publish_stage(executor, completion.fence, pending)?;
                 } else {
                     let kind = executor.manifest().graphs[completion.graph_index].kind;
                     self.complete(kind, completion)?;
                 }
                 progress = true;
             }
-            progress |= self.poll_stage()?;
+            progress |= self.poll_stage(executor)?;
             progress |= self.publish()?;
             progress |= self.service_store()?;
             let (step, planned) = self.plan(executor.outstanding())?;
@@ -1055,6 +1065,10 @@ impl<'a> Worker<'a> {
                 if executor.outstanding() > 0 {
                     std::hint::spin_loop();
                     thread::yield_now();
+                } else if !self.stage_kinds.is_empty() {
+                    // The local stage is done, but its scheduler submission remains
+                    // open until the remote stage commits the frame completion.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 } else {
                     self.scheduler.idle()?;
                     match self
@@ -1964,7 +1978,7 @@ impl<'a> Worker<'a> {
     }
 
     /// Delivers final-stage completions to the scheduler.
-    fn poll_stage(&mut self) -> Result<bool> {
+    fn poll_stage(&mut self, executor: &mut RankExecutor) -> Result<bool> {
         let Some(dispatch) = &self.dispatch else {
             return Ok(false);
         };
@@ -1979,10 +1993,22 @@ impl<'a> Worker<'a> {
                 .stage_kinds
                 .remove(&remote.fence)
                 .ok_or("pipeline completion has no submitted stage step")?;
-            let mut completion = self
-                .stage_locals
-                .remove(&remote.fence)
-                .unwrap_or(remote);
+            if let Some((view, host)) = &mut self.stage_pending {
+                for (slot, record) in remote.records.iter().enumerate() {
+                    if record.status == 0 || record.token_id < 0 {
+                        continue;
+                    }
+                    host.bytes_mut()[..size_of::<i64>()]
+                        .copy_from_slice(&record.token_id.to_ne_bytes());
+                    executor.write_buffer_range(
+                        &view.buffer,
+                        host,
+                        view.offset + slot * view.stride,
+                        size_of::<i64>(),
+                    )?;
+                }
+            }
+            let mut completion = remote;
             if completion.records.len() != self.config.limits.request_capacity() {
                 return Err("pipeline completion record count differs from stage zero".into());
             }
@@ -2129,7 +2155,6 @@ impl<'a> Worker<'a> {
                     } else {
                         StageActivation::Command
                     },
-                    local_completion: !pipeline_activation(step.kind),
                 },
             );
             self.stage_kinds.insert(fence, (step.kind, graph));

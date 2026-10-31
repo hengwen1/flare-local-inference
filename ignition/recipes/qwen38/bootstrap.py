@@ -223,10 +223,19 @@ def _pipeline_model_contract(base, config, pages, state_rows, snapshots):
     vision. Layer ranges and adjacent boundary buffers distinguish the stages.
     """
     stages = []
+    activation_kinds = (contract_proto.PREFILL, contract_proto.SCORED_PREFILL,
+                        contract_proto.DECODE, contract_proto.SPECULATIVE, contract_proto.MIXED)
     for index in range(config.pipeline_stages):
         first, last = config.stage_layers[index], config.stage_layers[index + 1]
         graphs = base["graphs"] if index == 0 else [
             graph for graph in base["graphs"] if graph["kind"] != contract_proto.VISION]
+        if index > 0:
+            graphs = [
+                {**graph, "inputs": [*graph.get("inputs", ()), contract_values.binding(
+                    "pipeline_activation", contract_proto.CONSTANT, contract_proto.SCALAR)]}
+                if graph["kind"] in activation_kinds else graph
+                for graph in graphs
+            ]
         stages.append(contract_values.pipeline_stage(index, first, last,
             pages=pages, state_rows=state_rows, snapshots=snapshots, graphs=graphs,
             cache=base["cache"], inputs=[] if index == 0 else ["pipeline_activation"],
@@ -426,6 +435,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 if kind == "scored_prefill":
                     function = PreparedScoredPrefill(function, requests, inputs)
                     fields = (*fields, "prompt_target_tokens")
+                if config.pipeline_stage > 0 and kind in (
+                        "prefill", "scored_prefill", "decode", "speculative", "mixed"):
+                    fields = (*fields, "pipeline_activation")
                 functions[name] = function
                 signatures[name] = GraphSignature(kind, batch, tokens, tuple(fields), speculation_enabled=enabled,
                                                   prefill_capacity=prefill_capacity)

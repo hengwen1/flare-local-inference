@@ -279,12 +279,31 @@ pub fn remote_upload_inputs(
         .graphs
         .get(graph as usize)
         .ok_or_else(|| protocol_error("pipeline stage graph index is out of range"))?;
-    Ok(contract
+    let mut inputs = contract
         .inputs
         .iter()
         .map(|binding| binding.buffer.clone())
         .filter(|name| name != boundary)
-        .collect())
+        .collect::<Vec<_>>();
+    if matches!(
+        contract.kind,
+        crate::model::contract::GraphOperation::Prefill
+            | crate::model::contract::GraphOperation::ScoredPrefill
+            | crate::model::contract::GraphOperation::Decode
+            | crate::model::contract::GraphOperation::Speculative
+            | crate::model::contract::GraphOperation::Mixed
+    ) {
+        for name in [
+            "logprob_requested",
+            "logprob_token_id_counts",
+            "logprob_token_ids",
+        ] {
+            if !inputs.iter().any(|input| input == name) {
+                inputs.push(name.to_owned());
+            }
+        }
+    }
+    Ok(inputs)
 }
 
 /// Copies the uploads a remote stage declares into a control payload.
@@ -450,11 +469,15 @@ pub(crate) fn boundary_bytes(boundary: &crate::model::contract::PipelineBoundary
 /// for the duration of the call. Stage execution is local; the manifest must not
 /// declare tensor-parallel peers.
 pub unsafe fn serve_stage(
-    manifest: ExecutionManifest,
+    mut manifest: ExecutionManifest,
     input: BoundaryLink,
     input_boundary: crate::model::contract::PipelineBoundary,
     output: Option<(BoundaryLink, crate::model::contract::PipelineBoundary)>,
 ) -> Result<()> {
+    // Stage zero owns the embedding tables and their readiness feedback. Later
+    // stages consume boundary activations instead and must not wait on engram
+    // synchronization they never produce.
+    manifest.engram = None;
     let input_bytes = boundary_bytes(&input_boundary)?;
     let slots = usize::try_from(input_boundary.slots).map_err(|_| {
         Error::execution(
@@ -621,12 +644,21 @@ pub unsafe fn serve_stage(
                             "pipeline stage executor reported backpressure after a completed frame",
                         ));
                     }
-                    let completion = loop {
+                    let mut completion = loop {
                         if let Some(completion) = executor.poll()? {
                             break completion;
                         }
                         std::thread::yield_now();
                     };
+                    // Stage-local execution sequences differ from the stage-zero
+                    // scheduler's fence. The boundary frame is the logical
+                    // submission identity for every stage.
+                    completion.fence = crate::cache::Fence(fence);
+                    for record in completion.records.iter_mut() {
+                        if record.status != 0 {
+                            record.submission_sequence = fence as i64;
+                        }
+                    }
 
                     if let Some((producer, boundary, bytes)) = output.as_mut() {
                         let Some(slot) = slot else {
@@ -968,7 +1000,12 @@ mod tests {
         assert!(select_stage_graph(&stage, "vision").is_err());
         assert_eq!(
             remote_upload_inputs(&stage, 0, "activation").unwrap(),
-            ["token_ids"]
+            [
+                "token_ids",
+                "logprob_requested",
+                "logprob_token_id_counts",
+                "logprob_token_ids",
+            ]
         );
     }
 

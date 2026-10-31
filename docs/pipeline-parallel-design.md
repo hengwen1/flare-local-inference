@@ -242,9 +242,12 @@ reuse is acknowledged by every stage before reuse.
 
 In M1, stage zero runs `Init`, `Restore`, `Snapshot`, and `Resume` locally and
 then sends the same prepared request to the next stage as a boundary `COMMAND`.
-The local completion is published only after the remote stage acknowledges. A
-remote rejection is fatal and does not roll back the local stage; a
-validate-then-commit command exchange is required before claiming cross-stage
+The last stage's completion is authoritative: stage zero retires its local frame
+without decoding a local completion vector, because non-final graphs do not own
+the sampling head. On every returned completion, stage zero writes each sampled
+token into its device pending-token state so the next local decode embeds the
+same token. A remote rejection is fatal and does not roll back the local stage;
+a validate-then-commit command exchange is required before claiming cross-stage
 atomicity.
 
 Prefix checkpoints remain in memory in this version. Pipeline packages reject

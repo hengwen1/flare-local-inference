@@ -47,4 +47,7 @@ def test_pipeline_contract_keeps_vision_and_head_on_opposite_stages():
     assert stages[0]["has_vision"] and not stages[1]["has_vision"]
     assert not stages[0]["has_head"] and stages[1]["has_head"]
     assert [graph["graph"] for graph in stages[1]["graphs"]] == ["decode1"]
+    assert stages[1]["graphs"][0]["inputs"] == [
+        {"buffer": "pipeline_activation", "source": p.CONSTANT,
+         "indexing": p.SCALAR, "value_offset": 0, "padding": 0, "tensor": ""}]
     assert contract["pipeline"]["boundary"][0]["buffer"] == "pipeline_activation"

@@ -568,7 +568,7 @@ impl GraphExecutor {
         if host.bytes().len() < nbytes {
             return Err(Error::execution(
                 ExecutionError::Capacity,
-                "boundary host buffer is smaller than the requested copy",
+                "host buffer is smaller than the requested copy",
             ));
         }
         let resources = self
@@ -586,6 +586,59 @@ impl GraphExecutor {
         resources.copy.synchronize()
     }
 
+    /// Uploads pinned host storage into one prepared buffer range after every
+    /// submitted frame has completed.
+    pub(crate) fn write_buffer_range(
+        &mut self,
+        name: &str,
+        host: &PinnedHost,
+        device_offset: usize,
+        nbytes: usize,
+    ) -> Result<()> {
+        if let Some(error) = &self.poison {
+            return Err(ExecutionError::Poisoned(Failure::caused_by(
+                format!("executor failed: {error}"),
+                error.clone(),
+            ))
+            .into());
+        }
+        if self.outstanding() != 0 {
+            return Err(Error::execution(
+                ExecutionError::State,
+                "cannot write a prepared buffer while frames are outstanding",
+            ));
+        }
+        let buffer = self.manifest.buffer(name)?;
+        if device_offset
+            .checked_add(nbytes)
+            .is_none_or(|end| end > buffer.nbytes)
+        {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "prepared buffer write exceeds the device buffer",
+            ));
+        }
+        if host.bytes().len() < nbytes {
+            return Err(Error::execution(
+                ExecutionError::Capacity,
+                "host buffer is smaller than the requested copy",
+            ));
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
+        // SAFETY: The manifest retains the device range and the pinned host
+        // buffer outlives the copy. No frame is outstanding, so the destination
+        // is not concurrently written by a graph.
+        unsafe {
+            resources
+                .model
+                .upload(buffer.address + device_offset, host, 0, nbytes)?
+        };
+        resources.model.synchronize()
+    }
+
     /// Uploads pinned host storage into one prepared buffer after every
     /// submitted frame has completed.
     pub(crate) fn write_buffer(&mut self, name: &str, host: &PinnedHost) -> Result<()> {
@@ -599,7 +652,7 @@ impl GraphExecutor {
         if self.outstanding() != 0 {
             return Err(Error::execution(
                 ExecutionError::State,
-                "cannot write a boundary buffer while frames are outstanding",
+                "cannot write a prepared buffer while frames are outstanding",
             ));
         }
         let resources = self
@@ -797,7 +850,7 @@ impl GraphExecutor {
                                               buffer.nbytes / 2)?;
                     }
                 }
-                if crate::engram::consumes(graph.kind) {
+                if resources.engram.is_some() && crate::engram::consumes(graph.kind) {
                     if let Some(readback) = &frame.readiness {
                         let buffer = self.manifest.buffer("readiness_timestamps")?;
                         readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
@@ -815,6 +868,18 @@ impl GraphExecutor {
     }
 
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
+        self.poll_inner(true)
+    }
+
+    /// Retires a local frame without decoding its completion vector.
+    ///
+    /// Pipeline stage zero executes its layers locally but does not own the
+    /// sampling head; the final stage's completion is authoritative.
+    pub fn poll_local(&mut self) -> Result<Option<FrameCompletion>> {
+        self.poll_inner(false)
+    }
+
+    fn poll_inner(&mut self, decode: bool) -> Result<Option<FrameCompletion>> {
         if let Some(error) = &self.poison {
             return Err(ExecutionError::Poisoned(Failure::caused_by(
                 format!("executor failed: {error}"),
@@ -858,6 +923,54 @@ impl GraphExecutor {
             }
         }
         self.completed = pending.fence;
+        if !decode {
+            let elapsed_ns = match frame.produced.elapsed_ns(&frame.started) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.poison = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            return Ok(Some(FrameCompletion {
+                fence: pending.fence,
+                graph_index: pending.graph_index,
+                timing: ExecutionTiming {
+                    gpu_ns: [
+                        Some(elapsed_ns),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    readiness: None,
+                    wall_ns: pending
+                        .dispatched
+                        .elapsed()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64,
+                    queued: pending.queued,
+                },
+                records: CompletionRecords {
+                    records: [CompletionRecord::default(); REQUEST_LANES],
+                    len: self.manifest.request_capacity(),
+                },
+                logprobs: None,
+                prompt_logprobs: None,
+                speculative_survival: None,
+                proposal_confidence: None,
+            }));
+        }
         let records = match decode_records(
             frame.output.bytes(),
             pending.fence,
@@ -912,7 +1025,9 @@ impl GraphExecutor {
                 return Err(error);
             }
         };
-        let readiness = if crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind) {
+        let readiness = if resources.engram.is_some()
+            && crate::engram::consumes(self.manifest.graphs[pending.graph_index].kind)
+        {
             frame.readiness.as_ref().map(|readback| {
                 // SAFETY: The frame's transfer event completed before decoding its retained readback.
                 ReadinessIntervals::decode(unsafe { readback.bytes() })
